@@ -1,0 +1,106 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Music Media Server — Full Stack
+#
+# Volumes layout on your host:
+#   /opt/music/          → persistent app configs
+#   /data/music/         → your music library (Lidarr writes, Navidrome reads)
+#   /data/downloads/     → staging area for rdt-client downloads
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Real-Debrid download proxy ──────────────────────────────────────────────
+  rdtclient:
+    image: rogerfar/rdtclient:latest
+    container_name: rdtclient
+    restart: unless-stopped
+    ports:
+      - "6500:6500"
+    volumes:
+      - /opt/music/rdtclient:/data/db
+      - /data/downloads:/data/downloads
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+
+  # ── Music collection manager ────────────────────────────────────────────────
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+      # Used by on-download.sh to trigger a Navidrome rescan after each import
+      - NAVIDROME_URL=http://navidrome:4533
+      - NAVIDROME_USER=${NAVIDROME_ADMIN_USER:-admin}
+      - NAVIDROME_PASS=${NAVIDROME_ADMIN_PASS}
+    volumes:
+      - /opt/music/lidarr:/config
+      - /data/music:/music
+      - /data/downloads:/downloads
+      # Hook: triggers Navidrome scan immediately when Lidarr imports a file
+      - ./on-download.sh:/config/scripts/on-download.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8686/api/v1/system/status",
+             "-H", "X-Api-Key:${LIDARR_API_KEY}"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Music streaming server (Subsonic API) ───────────────────────────────────
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    ports:
+      - "4533:4533"
+    environment:
+      ND_SCANSCHEDULE: 1h
+      ND_LOGLEVEL: info
+      ND_BASEURL: ""
+      # Sets the initial admin password (only used on first run)
+      ND_ADMINPASSWORD: ${NAVIDROME_ADMIN_PASS}
+      # Last.fm integration (enables similar artists + radio in Symfonium)
+      ND_LASTFM_ENABLED: "true"
+      ND_LASTFM_APIKEY: ${LASTFM_API_KEY}
+      ND_LASTFM_SECRET: ${LASTFM_SECRET}
+      # ListenBrainz — open-source scrobble alternative
+      ND_LISTENBRAINZ_ENABLED: "false"
+    volumes:
+      - /opt/music/navidrome:/data
+      - /data/music:/music:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4533/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Discovery bridge (Last.fm → Lidarr) ────────────────────────────────────
+  music-discovery:
+    build: ./music-discovery-bridge
+    container_name: music-discovery
+    restart: unless-stopped
+    environment:
+      LASTFM_API_KEY: ${LASTFM_API_KEY}
+      LASTFM_USERNAME: ${LASTFM_USERNAME}
+      LIDARR_URL: http://lidarr:8686
+      LIDARR_API_KEY: ${LIDARR_API_KEY}
+      LIDARR_ROOT_PATH: /music
+      TOP_ARTISTS_COUNT: "20"
+      SIMILAR_PER_ARTIST: "10"
+      MAX_NEW_ARTISTS: "5"
+      MIN_SIMILARITY: "0.25"
+      RUN_INTERVAL_SECONDS: "86400"
+    volumes:
+      - /opt/music/discovery:/data
+    depends_on:
+      - lidarr
