@@ -1,7 +1,7 @@
 # Music Media Server
 
 Self-hosted music stack with automatic discovery. Scrobbles your listening
-habits to Last.fm, uses them to find new artists, and automatically downloads
+habits to ListenBrainz, uses them to find new artists, and automatically downloads
 their music — so opening Symfonium on your phone always has something new.
 
 ---
@@ -19,8 +19,8 @@ their music — so opening Symfonium on your phone always has something new.
  │                                                                 │
  │  Navidrome :4533  ←── /data/music (read-only)                  │
  │       ↕ scrobbles                                               │
- │  Last.fm  ←─────────────────────────────────────────┐          │
- │       ↑                                             │          │
+ │  ListenBrainz  ←────────────────────────────────────┐          │
+ │       ↑                                              │          │
  │  music-discovery (nightly)  ───────► Lidarr :8686   │          │
  │       finds new artists             ↓               │          │
  │                               rdt-client :6500      │          │
@@ -38,7 +38,7 @@ their music — so opening Symfonium on your phone always has something new.
 | `rdtclient` | Real-Debrid proxy (fake qBittorrent API) | 6500 |
 | `lidarr` | Music collection manager | 8686 |
 | `navidrome` | Streaming server (Subsonic/OpenSubsonic API) | 4533 |
-| `music-discovery` | Last.fm → Lidarr discovery bridge | — |
+| `music-discovery` | ListenBrainz → Lidarr discovery bridge | — |
 
 ---
 
@@ -62,8 +62,8 @@ nano /opt/music-server/.env
 ```
 
 You need to fill in:
-- `LASTFM_API_KEY` + `LASTFM_SECRET` — from https://www.last.fm/api/account/create
-- `LASTFM_USERNAME` — your Last.fm username
+- `LISTENBRAINZ_USERNAME` — your ListenBrainz username ([listenbrainz.org](https://listenbrainz.org))
+- `LISTENBRAINZ_TOKEN` — optional for the discovery bridge (higher API limits); set it for Navidrome scrobbling ([settings](https://listenbrainz.org/settings/))
 - `NAVIDROME_ADMIN_PASS` — pick a strong password
 - `LIDARR_API_KEY` — you'll get this in Step 4 after Lidarr starts
 
@@ -128,7 +128,7 @@ docker compose up -d
    - Server URL: `http://YOUR-TAILSCALE-IP:4533`
    - Username: `admin`
    - Password: your `NAVIDROME_ADMIN_PASS`
-3. Settings → Scrobbling → Last.fm → Connect your account
+3. Settings → Scrobbling → ListenBrainz → connect with your ListenBrainz user token (same idea as in Navidrome; token from [ListenBrainz settings](https://listenbrainz.org/settings/))
 4. Settings → Cache → enable offline sync for your favourite artists
 
 ---
@@ -138,11 +138,11 @@ docker compose up -d
 The `music-discovery` container runs nightly and works like this:
 
 ```
-user.getTopArtists (Last.fm, 6-month window)
+GET /1/stats/user/{user}/artists (ListenBrainz, half-yearly stats)
         ↓
-artist.getSimilar for each of your top 20 artists
+Labs similar-artists API for each seed that has an artist MBID
         ↓
-Score candidates: sum similarity across all seeds
+Score candidates: sum normalized similarity across all seeds
         ↓
 Filter: remove artists already in Lidarr or previously added
         ↓
@@ -165,6 +165,13 @@ New music appears in Symfonium
 | `MIN_SIMILARITY` | 0.25 | Raise for stricter matching (0–1) |
 | `RUN_INTERVAL_SECONDS` | 86400 | How often to run (86400 = daily) |
 
+Optional environment variables for `music-discovery` (set in `docker-compose.yml` or override):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LISTENBRAINZ_STATS_RANGE` | `half_yearly` | ListenBrainz stats window (`week`, `month`, `year`, `all_time`, …) |
+| `LISTENBRAINZ_SIMILAR_ALGORITHM` | (session-based preset) | Labs [similar-artists](https://labs.api.listenbrainz.org/similar-artists) algorithm name |
+
 ### Useful commands
 
 ```bash
@@ -184,9 +191,9 @@ bash /opt/music-server/health-check.sh
 
 ### Cold-start tip
 
-Last.fm recommendations require listening history. Seed it faster by linking
-your Spotify account to Last.fm at https://www.last.fm/settings/applications —
-this imports your existing Spotify history and scrobbles everything going forward.
+ListenBrainz recommendations need **listening history** and **computed user statistics**. After you start scrobbling, stats may take up to about a day to appear; until then the stats API can return empty (`204`). You can import past listens (e.g. from Last.fm) via [ListenBrainz import tools](https://listenbrainz.org/import/) to seed your profile faster.
+
+Seed artists **without** a MusicBrainz ID in your top-artists stats are skipped for similarity lookup (the Labs API requires an artist MBID).
 
 ---
 

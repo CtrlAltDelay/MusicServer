@@ -68,12 +68,11 @@ services:
       ND_BASEURL: ""
       # Sets the initial admin password (only used on first run)
       ND_ADMINPASSWORD: ${NAVIDROME_ADMIN_PASS}
-      # Last.fm integration (enables similar artists + radio in Symfonium)
-      ND_LASTFM_ENABLED: "true"
-      ND_LASTFM_APIKEY: ${LASTFM_API_KEY}
-      ND_LASTFM_SECRET: ${LASTFM_SECRET}
-      # ListenBrainz — open-source scrobble alternative
-      ND_LISTENBRAINZ_ENABLED: "false"
+      # Last.fm (optional; disabled when not using Last.fm)
+      ND_LASTFM_ENABLED: "false"
+      # ListenBrainz — scrobbling + richer metadata in compatible clients
+      ND_LISTENBRAINZ_ENABLED: "true"
+      ND_LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
     volumes:
       - /opt/music/navidrome:/data
       - /data/music:/music:ro
@@ -84,14 +83,14 @@ services:
       retries: 3
       start_period: 20s
 
-  # ── Discovery bridge (Last.fm → Lidarr) ────────────────────────────────────
+  # ── Discovery bridge (ListenBrainz → Lidarr) ───────────────────────────────
   music-discovery:
     build: ./music-discovery-bridge
     container_name: music-discovery
     restart: unless-stopped
     environment:
-      LASTFM_API_KEY: ${LASTFM_API_KEY}
-      LASTFM_USERNAME: ${LASTFM_USERNAME}
+      LISTENBRAINZ_USERNAME: ${LISTENBRAINZ_USERNAME}
+      LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
       LIDARR_URL: http://lidarr:8686
       LIDARR_API_KEY: ${LIDARR_API_KEY}
       LIDARR_ROOT_PATH: /music
