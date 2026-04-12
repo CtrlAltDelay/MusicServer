@@ -77,12 +77,13 @@ fi
 info "Creating directory structure..."
 
 dirs=(
-    /opt/music/rdtclient
+    /opt/music/slskd
+    /opt/music/soularr
     /opt/music/lidarr
     /opt/music/navidrome
     /opt/music/discovery
     /data/music
-    /data/downloads
+    /data/slskd
     "$PROJECT_DIR"
 )
 
@@ -158,7 +159,7 @@ echo "  4. Check status:"
 echo "     cd $PROJECT_DIR && bash health-check.sh"
 echo ""
 echo "  Service URLs (replace with your Tailscale IP for remote access):"
-echo "     rdt-client  → http://$(hostname -I | awk '{print $1}'):6500"
+echo "     slskd       → http://$(hostname -I | awk '{print $1}'):5030"
 echo "     Lidarr      → http://$(hostname -I | awk '{print $1}'):8686"
 echo "     Navidrome   → http://$(hostname -I | awk '{print $1}'):4533"
 echo ""

@@ -4,6 +4,8 @@ Self-hosted music stack with automatic discovery. Scrobbles your listening
 habits to ListenBrainz, uses them to find new artists, and automatically downloads
 their music — so opening Symfonium on your phone always has something new.
 
+Downloads use **[Soularr](https://github.com/mrusse/soularr)** + **[slskd](https://github.com/slskd/slskd)** (Soulseek): Soularr polls Lidarr for wanted releases, searches Soulseek, and tells Lidarr to import completed downloads.
+
 ---
 
 ## Architecture
@@ -22,20 +24,23 @@ their music — so opening Symfonium on your phone always has something new.
  │  ListenBrainz  ←────────────────────────────────────┐          │
  │       ↑                                              │          │
  │  music-discovery (nightly)  ───────► Lidarr :8686   │          │
- │       finds new artists             ↓               │          │
- │                               rdt-client :6500      │          │
- │                               ↓                     │          │
- │                         Real-Debrid                 │          │
- │                               ↓                     │          │
- │                         /data/downloads             │          │
- │                               ↓                     │          │
+ │       finds new artists             ↑               │          │
+ │                               soularr (polls)       │          │
+ │                                     ↓               │          │
+ │                               slskd :5030           │          │
+ │                                     ↓               │          │
+ │                               Soulseek P2P          │          │
+ │                                     ↓               │          │
+ │                         /data/slskd (staging)       │          │
+ │                                     ↓               │          │
  │                    Lidarr imports → /data/music ────┘          │
  └─────────────────────────────────────────────────────────────────┘
 ```
 
 | Container | Purpose | Port |
 |---|---|---|
-| `rdtclient` | Real-Debrid proxy (fake qBittorrent API) | 6500 |
+| `slskd` | Soulseek daemon + web API | 5030 (5031, 50300 for P2P) |
+| `soularr` | Lidarr ↔ Soulseek bridge ([Soularr](https://github.com/mrusse/soularr)) | — |
 | `lidarr` | Music collection manager | 8686 |
 | `navidrome` | Streaming server (Subsonic/OpenSubsonic API) | 4533 |
 | `music-discovery` | ListenBrainz → Lidarr discovery bridge | — |
@@ -62,10 +67,11 @@ nano /opt/music-server/.env
 ```
 
 You need to fill in:
+- `SOULSEEK_USERNAME` / `SOULSEEK_PASSWORD` — Soulseek account ([slsknet.org](https://www.slsknet.org/))
 - `LISTENBRAINZ_USERNAME` — your ListenBrainz username ([listenbrainz.org](https://listenbrainz.org))
 - `LISTENBRAINZ_TOKEN` — optional for the discovery bridge (higher API limits); set it for Navidrome scrobbling ([settings](https://listenbrainz.org/settings/))
 - `NAVIDROME_ADMIN_PASS` — pick a strong password
-- `LIDARR_API_KEY` — you'll get this in Step 4 after Lidarr starts
+- `LIDARR_API_KEY` — you'll add this in Step 6 after Lidarr starts
 
 ### Step 3 — Connect Tailscale
 
@@ -81,38 +87,40 @@ Install Tailscale on your Android phone and sign in to the same account.
 
 ```bash
 cd /opt/music-server
-docker compose up -d rdtclient lidarr navidrome
+docker compose up -d slskd lidarr navidrome soularr
 ```
 
-### Step 5 — Configure rdt-client
+### Step 5 — Configure slskd and Soularr
 
-1. Open `http://YOUR-LAN-IP:6500`
-2. Create login credentials on first visit
-3. Settings → Real-Debrid API Key → paste your key from https://real-debrid.com/apitoken
-4. Download path: `/data/downloads`
-5. Mapped path: `/data/downloads`
-6. Save
+1. Open **slskd** at `http://YOUR-LAN-IP:5030` and complete first-time setup if prompted (Soulseek login may already be applied from `.env`).
+2. Create an **API key** in slskd (see [slskd docs](https://github.com/slskd/slskd) — typically under web authentication / API keys in config or UI).
+3. Copy the Soularr config template and edit it on the host:
+   ```bash
+   sudo cp /opt/music-server/soularr/config.ini.example /opt/music/soularr/config.ini
+   sudo nano /opt/music/soularr/config.ini
+   ```
+4. Set `[Lidarr] api_key` to your Lidarr API key (from Step 6 once Lidarr is up) and `[Slskd] api_key` to the slskd API key from step 2.
+5. Restart Soularr so it picks up the config:
+   ```bash
+   docker restart soularr
+   ```
+
+Soularr is **not** a Lidarr “download client” — it talks to Lidarr and slskd over HTTP. You may see a Lidarr health warning about no download clients; that is **expected** and safe to ignore for this stack.
 
 ### Step 6 — Configure Lidarr
 
 1. Open `http://YOUR-LAN-IP:8686`
-2. **Add download client:**
-   Settings → Download Clients → `+` → qBittorrent
-   - Host: `rdtclient`
-   - Port: `6500`
-   - Username / Password: your rdt-client credentials
-   - Category: `lidarr`
-   - Test → Save
+2. **Do not add** qBittorrent / rdt-client — Soularr handles acquisition.
 3. **Add root folder:**
    Settings → Media Management → Root Folders → `/music`
 4. **Copy your API key:**
-   Settings → General → Security → API Key → paste into `.env` as `LIDARR_API_KEY`
+   Settings → General → Security → API Key → paste into `.env` as `LIDARR_API_KEY`, and into `/opt/music/soularr/config.ini` under `[Lidarr] api_key`, then `docker restart soularr`.
 5. **Register the on-download hook:**
    Settings → Connect → `+` → Custom Script
    - Name: `Navidrome Rescan`
    - Path: `/config/scripts/on-download.sh`
-   - Triggers: ✓ On Import, ✓ On Upgrade
-   - Test → Save
+   - Triggers: ✓ On Release Import, ✓ On Upgrade
+   - Test → Save (ensure `on-download.sh` is executable on the host: `chmod +x /opt/music-server/on-download.sh`)
 6. **Add your first artists** to seed your library (20–30 is a good start)
 
 ### Step 7 — Restart to apply the API key, then start discovery
@@ -128,8 +136,13 @@ docker compose up -d
    - Server URL: `http://YOUR-TAILSCALE-IP:4533`
    - Username: `admin`
    - Password: your `NAVIDROME_ADMIN_PASS`
-3. Settings → Scrobbling → ListenBrainz → connect with your ListenBrainz user token (same idea as in Navidrome; token from [ListenBrainz settings](https://listenbrainz.org/settings/))
-4. Settings → Cache → enable offline sync for your favourite artists
+3. Settings → Cache → enable offline sync for your favourite artists
+
+Scrobbling is handled by **Navidrome**, not Symfonium. To enable it:
+1. Open the Navidrome web UI (`http://YOUR-TAILSCALE-IP:4533`)
+2. Click your username (top right) → Personal Settings
+3. Under **ListenBrainz**, paste your user token from [listenbrainz.org/settings](https://listenbrainz.org/settings/)
+4. Save — Navidrome will now scrobble every play Symfonium reports to it
 
 ---
 
@@ -148,7 +161,9 @@ Filter: remove artists already in Lidarr or previously added
         ↓
 Top 5 candidates → added to Lidarr, tagged "discovered"
         ↓
-Lidarr grabs their latest album via rdt-client → /data/music
+Soularr + slskd fetch wanted releases from Soulseek → /data/slskd
+        ↓
+Lidarr imports → /data/music
         ↓
 on-download.sh fires → Navidrome rescans immediately
         ↓
@@ -172,13 +187,18 @@ Optional environment variables for `music-discovery` (set in `docker-compose.yml
 | `LISTENBRAINZ_STATS_RANGE` | `half_yearly` | ListenBrainz stats window (`week`, `month`, `year`, `all_time`, …) |
 | `LISTENBRAINZ_SIMILAR_ALGORITHM` | (session-based preset) | Labs [similar-artists](https://labs.api.listenbrainz.org/similar-artists) algorithm name |
 
+Soularr’s poll interval is `SCRIPT_INTERVAL` (seconds) in `docker-compose.yml` for the `soularr` service (default `300`).
+
 ### Useful commands
 
 ```bash
 # Watch discovery run live
 docker logs -f music-discovery
 
-# Force an immediate run
+# Watch Soularr (wanted → Soulseek → import)
+docker logs -f soularr
+
+# Force an immediate discovery run
 docker restart music-discovery
 
 # See everything the bridge has ever added
@@ -207,20 +227,22 @@ Seed artists **without** a MusicBrainz ID in your top-artists stats are skipped 
   setup.sh
   health-check.sh
   on-download.sh
-  music-discovery-bridge/
-    discovery.py
-    Dockerfile
-    requirements.txt
+  soularr/
+    config.ini.example      ← copy to /opt/music/soularr/config.ini
+  discovery.py
+  Dockerfile
+  requirements.txt
 
 /opt/music/                 ← persistent container configs
-  rdtclient/
+  slskd/
+  soularr/                  ← config.ini (not in git; copy from example)
   lidarr/
   navidrome/
   discovery/                ← discovery.db + discovery.log
 
 /data/
   music/                    ← your music library
-  downloads/                ← staging area (auto-cleared by Lidarr)
+  slskd/                    ← Soulseek download staging (Lidarr + slskd + soularr)
 ```
 
 ---
@@ -238,6 +260,9 @@ and change their monitoring from "Latest Album" to "All Albums".
 **Want stricter recommendations?** Raise `MIN_SIMILARITY` to `0.5` or higher.
 This filters out artists that are only loosely related to your taste.
 
-**Disk filling up?** Check `/data/downloads` first — Lidarr should clear it
-after import, but failed downloads can linger. Also consider setting
-`MAX_NEW_ARTISTS` lower.
+**Disk filling up?** Check `/data/slskd` first — failed or partial Soulseek
+downloads can linger. Also consider lowering Soularr `number_of_albums_to_grab`
+in `config.ini` or `MAX_NEW_ARTISTS` for discovery.
+
+**Soulseek** is a peer-to-peer network; only acquire material you have the
+rights to use, and ensure your host/network policy allows it.

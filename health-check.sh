@@ -33,7 +33,7 @@ fi
 LIDARR_API_KEY="${LIDARR_API_KEY:-}"
 LIDARR_URL="http://localhost:8686"
 NAVIDROME_URL="http://localhost:4533"
-RDTCLIENT_URL="http://localhost:6500"
+SLSKD_URL="http://localhost:5030"
 DISCOVERY_DB="/opt/music/discovery/discovery.db"
 
 # ── Helper: HTTP check ────────────────────────────────────────────────────────
@@ -44,9 +44,16 @@ http_ok() {
     [[ "$code" =~ ^[23] ]]
 }
 
+# slskd often returns 401 without auth — treat as reachable
+http_ok_slskd() {
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$SLSKD_URL" 2>/dev/null || echo "000")
+    [[ "$code" =~ ^(2|3|401)$ ]]
+}
+
 # ── 1. Docker containers ──────────────────────────────────────────────────────
 hdr "Docker Containers"
-containers=("rdtclient" "lidarr" "navidrome" "music-discovery")
+containers=("slskd" "soularr" "lidarr" "navidrome" "music-discovery")
 all_running=true
 for name in "${containers[@]}"; do
     status=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || echo "not found")
@@ -62,8 +69,13 @@ done
 # ── 2. HTTP reachability ──────────────────────────────────────────────────────
 hdr "Service Reachability"
 
+if http_ok_slskd; then
+    ok "slskd → $SLSKD_URL"
+else
+    fail "slskd → $SLSKD_URL (not responding)"
+fi
+
 declare -A services=(
-    ["rdt-client"]="$RDTCLIENT_URL"
     ["Lidarr"]="$LIDARR_URL"
     ["Navidrome"]="$NAVIDROME_URL"
 )
@@ -124,7 +136,7 @@ fi
 
 # ── 4. Disk space ─────────────────────────────────────────────────────────────
 hdr "Disk Space"
-for path in /data/music /data/downloads; do
+for path in /data/music /data/slskd; do
     if [[ -d "$path" ]]; then
         read -r used avail pct <<< "$(df -h "$path" | tail -1 | awk '{print $3, $4, $5}')"
         if [[ "${pct%%%}" -gt 90 ]]; then

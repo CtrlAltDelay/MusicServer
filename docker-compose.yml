@@ -6,25 +6,46 @@ version: "3.9"
 # Volumes layout on your host:
 #   /opt/music/          → persistent app configs
 #   /data/music/         → your music library (Lidarr writes, Navidrome reads)
-#   /data/downloads/     → staging area for rdt-client downloads
+#   /data/slskd/         → Soulseek download staging (slskd + Lidarr import path)
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── Real-Debrid download proxy ──────────────────────────────────────────────
-  rdtclient:
-    image: rogerfar/rdtclient:latest
-    container_name: rdtclient
+  # ── Soulseek daemon (downloads + API for Soularr) ───────────────────────────
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+      - SLSKD_REMOTE_CONFIGURATION=true
+      - SLSKD_SLSK_USERNAME=${SOULSEEK_USERNAME}
+      - SLSKD_SLSK_PASSWORD=${SOULSEEK_PASSWORD}
     ports:
-      - "6500:6500"
+      - "5030:5030"
+      - "5031:5031"
+      - "50300:50300"
     volumes:
-      - /opt/music/rdtclient:/data/db
-      - /data/downloads:/data/downloads
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
+      - /opt/music/slskd:/app
+      - /data/slskd:/downloads
+
+  # ── Lidarr ↔ Soulseek bridge (polls wanted, searches slskd, triggers import) ─
+  soularr:
+    image: mrusse08/soularr:latest
+    container_name: soularr
+    user: "${PUID:-1000}:${PGID:-1000}"
+    hostname: soularr
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-UTC}
+      - SCRIPT_INTERVAL=300
+    volumes:
+      - /data/slskd:/downloads
+      - /opt/music/soularr:/data
+    depends_on:
+      - lidarr
+      - slskd
 
   # ── Music collection manager ────────────────────────────────────────────────
   lidarr:
@@ -44,7 +65,7 @@ services:
     volumes:
       - /opt/music/lidarr:/config
       - /data/music:/music
-      - /data/downloads:/downloads
+      - /data/slskd:/slskd_downloads
       # Hook: triggers Navidrome scan immediately when Lidarr imports a file
       - ./on-download.sh:/config/scripts/on-download.sh:ro
     healthcheck:
@@ -85,7 +106,7 @@ services:
 
   # ── Discovery bridge (ListenBrainz → Lidarr) ───────────────────────────────
   music-discovery:
-    build: ./music-discovery-bridge
+    build: .
     container_name: music-discovery
     restart: unless-stopped
     environment:
