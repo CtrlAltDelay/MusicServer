@@ -15,13 +15,16 @@ services:
   slskd:
     image: slskd/slskd:latest
     container_name: slskd
-    user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
+    user: ${PUID:-1000}:${PGID:-1000}
     environment:
       - TZ=${TZ:-UTC}
       - SLSKD_REMOTE_CONFIGURATION=true
       - SLSKD_SLSK_USERNAME=${SOULSEEK_USERNAME}
       - SLSKD_SLSK_PASSWORD=${SOULSEEK_PASSWORD}
+      - SLSKD_API_KEY=${SLSKD_API_KEY}
+      - SLSKD_DOWNLOADS_DIR=/downloads
+      - SLSKD_INCOMPLETE_DIR=/downloads/.incomplete
     ports:
       - "5030:5030"
       - "5031:5031"
@@ -34,9 +37,9 @@ services:
   soularr:
     image: mrusse08/soularr:latest
     container_name: soularr
-    user: "${PUID:-1000}:${PGID:-1000}"
     hostname: soularr
     restart: unless-stopped
+    user: ${PUID:-1000}:${PGID:-1000}
     environment:
       - TZ=${TZ:-UTC}
       - SCRIPT_INTERVAL=300
@@ -110,7 +113,6 @@ services:
     container_name: music-discovery
     restart: unless-stopped
     ports:
-      # Host port → container 8765 (Flask). Change the left side if 8765 is taken on the host.
       - "${DISCOVERY_HOST_GUI_PORT:-8765}:8765"
     environment:
       LISTENBRAINZ_USERNAME: ${LISTENBRAINZ_USERNAME}
@@ -118,10 +120,9 @@ services:
       LIDARR_URL: http://lidarr:8686
       LIDARR_API_KEY: ${LIDARR_API_KEY}
       LIDARR_ROOT_PATH: /music
-      # most_listened | loved | both — GUI can override via /data/settings.json
-      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-most_listened}
+      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-loved}  # most_listened | loved | both
+      LOVED_FEEDBACK_COUNT: "200"
       TOP_ARTISTS_COUNT: "20"
-      LOVED_FEEDBACK_COUNT: "100"
       SIMILAR_PER_ARTIST: "10"
       MAX_NEW_ARTISTS: "5"
       MIN_SIMILARITY: "0.25"

@@ -67,7 +67,7 @@ nano /opt/music-server/.env
 ```
 
 You need to fill in:
-- `SOULSEEK_USERNAME` / `SOULSEEK_PASSWORD` — Soulseek account ([slsknet.org](https://www.slsknet.org/))
+- `SOULSEEK_USERNAME` / `SOULSEEK_PASSWORD` — pick any username/password; a Soulseek account is created automatically on first connect (no prior registration needed)
 - `LISTENBRAINZ_USERNAME` — your ListenBrainz username ([listenbrainz.org](https://listenbrainz.org))
 - `LISTENBRAINZ_TOKEN` — optional for the discovery bridge (higher API limits); set it for Navidrome scrobbling ([settings](https://listenbrainz.org/settings/))
 - `NAVIDROME_ADMIN_PASS` — pick a strong password
@@ -92,14 +92,22 @@ docker compose up -d slskd lidarr navidrome soularr
 
 ### Step 5 — Configure slskd and Soularr
 
-1. Open **slskd** at `http://YOUR-LAN-IP:5030` and complete first-time setup if prompted (Soulseek login may already be applied from `.env`).
-2. Create an **API key** in slskd (see [slskd docs](https://github.com/slskd/slskd) — typically under web authentication / API keys in config or UI).
+1. Open **slskd** at `http://YOUR-LAN-IP:5030` (default login: `slskd` / `slskd`).
+   If slskd is stuck restarting, check `docker logs slskd` — a "not writeable" error means the host directory permissions are wrong. Fix with: `sudo chown -R 1000:1000 /opt/music/slskd /data/slskd`
+2. Generate a random **API key** for slskd and add it to `.env`:
+   ```bash
+   # Generate a random key
+   openssl rand -hex 24
+   # Paste the output into .env as SLSKD_API_KEY, then restart slskd
+   nano /opt/music-server/.env
+   docker compose up -d slskd
+   ```
 3. Copy the Soularr config template and edit it on the host:
    ```bash
    sudo cp /opt/music-server/soularr/config.ini.example /opt/music/soularr/config.ini
    sudo nano /opt/music/soularr/config.ini
    ```
-4. Set `[Lidarr] api_key` to your Lidarr API key (from Step 6 once Lidarr is up) and `[Slskd] api_key` to the slskd API key from step 2.
+4. Set `[Slskd] api_key` to the same key you put in `.env`. Set `[Lidarr] api_key` to your Lidarr API key (from Step 6 once Lidarr is up).
 5. Restart Soularr so it picks up the config:
    ```bash
    docker restart soularr
@@ -115,19 +123,41 @@ Soularr is **not** a Lidarr “download client” — it talks to Lidarr and sls
    Settings → Media Management → Root Folders → `/music`
 4. **Copy your API key:**
    Settings → General → Security → API Key → paste into `.env` as `LIDARR_API_KEY`, and into `/opt/music/soularr/config.ini` under `[Lidarr] api_key`, then `docker restart soularr`.
-5. **Register the on-download hook:**
+5. **Make the hook script executable on the host** (required before Lidarr can run it):
+   ```bash
+   chmod +x /opt/music-server/on-download.sh
+   ```
+6. **Register the on-download hook in Lidarr:**
    Settings → Connect → `+` → Custom Script
    - Name: `Navidrome Rescan`
    - Path: `/config/scripts/on-download.sh`
    - Triggers: ✓ On Release Import, ✓ On Upgrade
-   - Test → Save (ensure `on-download.sh` is executable on the host: `chmod +x /opt/music-server/on-download.sh`)
+   - Test → Save
 6. **Add your first artists** to seed your library (20–30 is a good start)
 
 ### Step 7 — Restart to apply the API key, then start discovery
 
+Ensure `LIDARR_API_KEY` is filled in your `.env`, then bring up the full stack (this starts `music-discovery` for the first time):
+
 ```bash
+cd /opt/music-server
 docker compose up -d
 ```
+
+Check that all containers are running:
+
+```bash
+docker ps
+```
+
+The discovery container runs on a 24-hour timer. To trigger an immediate run rather than waiting:
+
+```bash
+docker restart music-discovery
+docker logs -f music-discovery   # watch it run live
+```
+
+> **Note:** ListenBrainz needs listening history to make recommendations. If you haven't scrobbled much yet, the first run may add nothing (`204` from the stats API is normal). Seed it faster by importing Last.fm history at [listenbrainz.org/import](https://listenbrainz.org/import/), or just add 20–30 artists to Lidarr manually first.
 
 ### Step 8 — Configure Symfonium (Android)
 
@@ -178,15 +208,15 @@ After `docker compose up -d music-discovery`, open `http://YOUR-LAN-IP:${DISCOVE
 
 If you set `DISCOVERY_GUI_TOKEN` in `.env`, append `?token=YOUR_TOKEN` to the URL (or send header `X-Discovery-Token`) so the UI and API are not open anonymously on your LAN.
 
-Set `DISCOVERY_GUI_PORT=0` in `docker-compose.yml` if you want the old headless-only behavior (no HTTP server).
+Set `DISCOVERY_GUI_PORT=0` in `docker-compose.yml` if you want headless-only behavior (no HTTP server).
 
 ### Tuning knobs (in `docker-compose.yml` or the web UI)
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DISCOVERY_SEED_MODE` | `most_listened` | `most_listened` (stats), `loved` (ListenBrainz loved tracks → artists), or `both` |
+| `DISCOVERY_SEED_MODE` | `loved` | `most_listened` (stats), `loved` (ListenBrainz loved tracks → artists), or `both` |
 | `TOP_ARTISTS_COUNT` | 20 | More seeds = broader recommendations |
-| `LOVED_FEEDBACK_COUNT` | 100 | How many loved recordings to page through when seed mode includes `loved` |
+| `LOVED_FEEDBACK_COUNT` | 200 | How many loved recordings to page through when seed mode includes `loved` |
 | `SIMILAR_PER_ARTIST` | 10 | Candidates per seed artist |
 | `MAX_NEW_ARTISTS` | 5 | Max additions per nightly run |
 | `MIN_SIMILARITY` | 0.25 | Raise for stricter matching (0–1) |
@@ -210,7 +240,7 @@ docker logs -f music-discovery
 # Watch Soularr (wanted → Soulseek → import)
 docker logs -f soularr
 
-# Force an immediate discovery run (or use “Run discovery now” in the web UI)
+# Force an immediate discovery run (or use "Run discovery now" in the web UI)
 docker restart music-discovery
 
 # See everything the bridge has ever added
@@ -227,7 +257,7 @@ ListenBrainz recommendations need **listening history** and **computed user stat
 
 Seed artists **without** a MusicBrainz ID are skipped for similarity lookup (the Labs API requires an artist MBID). Loved-track mode resolves MBIDs via ListenBrainz metadata when possible.
 
-**Note:** “Loved” here means **ListenBrainz recording feedback** (the heart on ListenBrainz clients), not a separate MusicBrainz.org account API.
+**Note:** "Loved" here means **ListenBrainz recording feedback** (the heart on ListenBrainz clients), not a separate MusicBrainz.org account API.
 
 ---
 
