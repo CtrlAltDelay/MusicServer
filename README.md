@@ -43,7 +43,7 @@ Downloads use **[Soularr](https://github.com/mrusse/soularr)** + **[slskd](https
 | `soularr` | Lidarr ↔ Soulseek bridge ([Soularr](https://github.com/mrusse/soularr)) | — |
 | `lidarr` | Music collection manager | 8686 |
 | `navidrome` | Streaming server (Subsonic/OpenSubsonic API) | 4533 |
-| `music-discovery` | ListenBrainz → Lidarr discovery bridge | — |
+| `music-discovery` | ListenBrainz → Lidarr discovery bridge + optional web UI | `${DISCOVERY_HOST_GUI_PORT:-8765}` (default 8765) |
 
 ---
 
@@ -148,10 +148,12 @@ Scrobbling is handled by **Navidrome**, not Symfonium. To enable it:
 
 ## Discovery Bridge
 
-The `music-discovery` container runs nightly and works like this:
+The `music-discovery` container runs on a timer and works like this:
 
 ```
-GET /1/stats/user/{user}/artists (ListenBrainz, half-yearly stats)
+Seed artists from ListenBrainz:
+  • most listened (user stats), and/or
+  • loved recordings (feedback → MusicBrainz recording metadata → artist MBIDs)
         ↓
 Labs similar-artists API for each seed that has an artist MBID
         ↓
@@ -170,11 +172,21 @@ on-download.sh fires → Navidrome rescans immediately
 New music appears in Symfonium
 ```
 
-### Tuning knobs (in `docker-compose.yml`)
+### Web UI
+
+After `docker compose up -d music-discovery`, open `http://YOUR-LAN-IP:${DISCOVERY_HOST_GUI_PORT:-8765}` (or whatever you set in `.env` as `DISCOVERY_HOST_GUI_PORT`). The UI shows recent runs, artists the bridge added, live log tail, and lets you edit tunables (stored in `/opt/music/discovery/settings.json` inside the container volume). Secrets stay in environment variables.
+
+If you set `DISCOVERY_GUI_TOKEN` in `.env`, append `?token=YOUR_TOKEN` to the URL (or send header `X-Discovery-Token`) so the UI and API are not open anonymously on your LAN.
+
+Set `DISCOVERY_GUI_PORT=0` in `docker-compose.yml` if you want the old headless-only behavior (no HTTP server).
+
+### Tuning knobs (in `docker-compose.yml` or the web UI)
 
 | Variable | Default | Effect |
 |---|---|---|
+| `DISCOVERY_SEED_MODE` | `most_listened` | `most_listened` (stats), `loved` (ListenBrainz loved tracks → artists), or `both` |
 | `TOP_ARTISTS_COUNT` | 20 | More seeds = broader recommendations |
+| `LOVED_FEEDBACK_COUNT` | 100 | How many loved recordings to page through when seed mode includes `loved` |
 | `SIMILAR_PER_ARTIST` | 10 | Candidates per seed artist |
 | `MAX_NEW_ARTISTS` | 5 | Max additions per nightly run |
 | `MIN_SIMILARITY` | 0.25 | Raise for stricter matching (0–1) |
@@ -198,7 +210,7 @@ docker logs -f music-discovery
 # Watch Soularr (wanted → Soulseek → import)
 docker logs -f soularr
 
-# Force an immediate discovery run
+# Force an immediate discovery run (or use “Run discovery now” in the web UI)
 docker restart music-discovery
 
 # See everything the bridge has ever added
@@ -213,7 +225,9 @@ bash /opt/music-server/health-check.sh
 
 ListenBrainz recommendations need **listening history** and **computed user statistics**. After you start scrobbling, stats may take up to about a day to appear; until then the stats API can return empty (`204`). You can import past listens (e.g. from Last.fm) via [ListenBrainz import tools](https://listenbrainz.org/import/) to seed your profile faster.
 
-Seed artists **without** a MusicBrainz ID in your top-artists stats are skipped for similarity lookup (the Labs API requires an artist MBID).
+Seed artists **without** a MusicBrainz ID are skipped for similarity lookup (the Labs API requires an artist MBID). Loved-track mode resolves MBIDs via ListenBrainz metadata when possible.
+
+**Note:** “Loved” here means **ListenBrainz recording feedback** (the heart on ListenBrainz clients), not a separate MusicBrainz.org account API.
 
 ---
 

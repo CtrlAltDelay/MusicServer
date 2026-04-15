@@ -109,17 +109,26 @@ services:
     build: .
     container_name: music-discovery
     restart: unless-stopped
+    ports:
+      # Host port → container 8765 (Flask). Change the left side if 8765 is taken on the host.
+      - "${DISCOVERY_HOST_GUI_PORT:-8765}:8765"
     environment:
       LISTENBRAINZ_USERNAME: ${LISTENBRAINZ_USERNAME}
       LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
       LIDARR_URL: http://lidarr:8686
       LIDARR_API_KEY: ${LIDARR_API_KEY}
       LIDARR_ROOT_PATH: /music
+      # most_listened | loved | both — GUI can override via /data/settings.json
+      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-most_listened}
       TOP_ARTISTS_COUNT: "20"
+      LOVED_FEEDBACK_COUNT: "100"
       SIMILAR_PER_ARTIST: "10"
       MAX_NEW_ARTISTS: "5"
       MIN_SIMILARITY: "0.25"
       RUN_INTERVAL_SECONDS: "86400"
+      LISTENBRAINZ_STATS_RANGE: ${LISTENBRAINZ_STATS_RANGE:-half_yearly}
+      DISCOVERY_GUI_PORT: "8765"
+      DISCOVERY_GUI_TOKEN: ${DISCOVERY_GUI_TOKEN:-}
     volumes:
       - /opt/music/discovery:/data
     depends_on:
