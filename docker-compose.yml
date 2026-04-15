@@ -1,0 +1,136 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Music Media Server — Full Stack
+#
+# Volumes layout on your host:
+#   /opt/music/          → persistent app configs
+#   /data/music/         → your music library (Lidarr writes, Navidrome reads)
+#   /data/slskd/         → Soulseek download staging (slskd + Lidarr import path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Soulseek daemon (downloads + API for Soularr) ───────────────────────────
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    restart: unless-stopped
+    user: ${PUID:-1000}:${PGID:-1000}
+    environment:
+      - TZ=${TZ:-UTC}
+      - SLSKD_REMOTE_CONFIGURATION=true
+      - SLSKD_SLSK_USERNAME=${SOULSEEK_USERNAME}
+      - SLSKD_SLSK_PASSWORD=${SOULSEEK_PASSWORD}
+      - SLSKD_API_KEY=${SLSKD_API_KEY}
+      - SLSKD_DOWNLOADS_DIR=/downloads
+      - SLSKD_INCOMPLETE_DIR=/downloads/.incomplete
+    ports:
+      - "5030:5030"
+      - "5031:5031"
+      - "50300:50300"
+    volumes:
+      - /opt/music/slskd:/app
+      - /data/slskd:/downloads
+
+  # ── Lidarr ↔ Soulseek bridge (polls wanted, searches slskd, triggers import) ─
+  soularr:
+    image: mrusse08/soularr:latest
+    container_name: soularr
+    hostname: soularr
+    restart: unless-stopped
+    user: ${PUID:-1000}:${PGID:-1000}
+    environment:
+      - TZ=${TZ:-UTC}
+      - SCRIPT_INTERVAL=300
+    volumes:
+      - /data/slskd:/downloads
+      - /opt/music/soularr:/data
+    depends_on:
+      - lidarr
+      - slskd
+
+  # ── Music collection manager ────────────────────────────────────────────────
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+      # Used by on-download.sh to trigger a Navidrome rescan after each import
+      - NAVIDROME_URL=http://navidrome:4533
+      - NAVIDROME_USER=${NAVIDROME_ADMIN_USER:-admin}
+      - NAVIDROME_PASS=${NAVIDROME_ADMIN_PASS}
+    volumes:
+      - /opt/music/lidarr:/config
+      - /data/music:/music
+      - /data/slskd:/slskd_downloads
+      # Hook: triggers Navidrome scan immediately when Lidarr imports a file
+      - ./on-download.sh:/config/scripts/on-download.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8686/api/v1/system/status",
+             "-H", "X-Api-Key:${LIDARR_API_KEY}"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Music streaming server (Subsonic API) ───────────────────────────────────
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    ports:
+      - "4533:4533"
+    environment:
+      ND_SCANSCHEDULE: 1h
+      ND_LOGLEVEL: info
+      ND_BASEURL: ""
+      # Sets the initial admin password (only used on first run)
+      ND_ADMINPASSWORD: ${NAVIDROME_ADMIN_PASS}
+      # Last.fm (optional; disabled when not using Last.fm)
+      ND_LASTFM_ENABLED: "false"
+      # ListenBrainz — scrobbling + richer metadata in compatible clients
+      ND_LISTENBRAINZ_ENABLED: "true"
+      ND_LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
+    volumes:
+      - /opt/music/navidrome:/data
+      - /data/music:/music:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4533/ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Discovery bridge (ListenBrainz → Lidarr) ───────────────────────────────
+  music-discovery:
+    build: .
+    container_name: music-discovery
+    restart: unless-stopped
+    ports:
+      - "${DISCOVERY_HOST_GUI_PORT:-8765}:8765"
+    environment:
+      LISTENBRAINZ_USERNAME: ${LISTENBRAINZ_USERNAME}
+      LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
+      LIDARR_URL: http://lidarr:8686
+      LIDARR_API_KEY: ${LIDARR_API_KEY}
+      LIDARR_ROOT_PATH: /music
+      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-loved}  # most_listened | loved | both
+      LOVED_FEEDBACK_COUNT: "200"
+      TOP_ARTISTS_COUNT: "20"
+      SIMILAR_PER_ARTIST: "10"
+      MAX_NEW_ARTISTS: "5"
+      MIN_SIMILARITY: "0.25"
+      RUN_INTERVAL_SECONDS: "86400"
+      LISTENBRAINZ_STATS_RANGE: ${LISTENBRAINZ_STATS_RANGE:-half_yearly}
+      DISCOVERY_GUI_PORT: "8765"
+      DISCOVERY_GUI_TOKEN: ${DISCOVERY_GUI_TOKEN:-}
+    volumes:
+      - /opt/music/discovery:/data
+    depends_on:
+      - lidarr

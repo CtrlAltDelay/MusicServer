@@ -1,0 +1,6 @@
+.env
+soularr/config.ini
+*.db
+*.log
+__pycache__/
+*.pyc
