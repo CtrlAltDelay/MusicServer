@@ -912,13 +912,15 @@ def run_discovery(config: dict | None = None) -> dict:
 
 
 def _scheduler_loop() -> None:
+    """Wait run_interval_seconds between runs; no immediate run on process start (use GUI for that)."""
     while not _scheduler_stop.is_set():
         cfg = _coerce_settings(effective_settings())
-        run_discovery(cfg)
         sleep_seconds = int(cfg["run_interval_seconds"])
-        log.info("Next run in %d seconds.", sleep_seconds)
+        log.info("Next scheduled discovery run in %d seconds.", sleep_seconds)
         if _scheduler_stop.wait(timeout=sleep_seconds):
             return
+        cfg = _coerce_settings(effective_settings())
+        run_discovery(cfg)
 
 
 def start_scheduler_background() -> None:
