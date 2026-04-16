@@ -21,7 +21,7 @@ import time
 import logging
 import sqlite3
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -231,6 +231,9 @@ def init_db():
             status      TEXT
         )
     """)
+    _aa_cols = {row[1] for row in conn.execute("PRAGMA table_info(added_artists)")}
+    if "run_id" not in _aa_cols:
+        conn.execute("ALTER TABLE added_artists ADD COLUMN run_id INTEGER")
     conn.commit()
     return conn
 
@@ -243,10 +246,10 @@ def was_already_added(conn, name: str, mbid: str) -> bool:
     return row is not None
 
 
-def record_added(conn, name: str, mbid: str, lidarr_id: int):
+def record_added(conn, name: str, mbid: str, lidarr_id: int, run_id: int | None = None):
     conn.execute(
-        "INSERT OR IGNORE INTO added_artists (mbid, name, added_at, lidarr_id) VALUES (?,?,?,?)",
-        (mbid, name.lower(), datetime.utcnow().isoformat(), lidarr_id),
+        "INSERT OR IGNORE INTO added_artists (mbid, name, added_at, lidarr_id, run_id) VALUES (?,?,?,?,?)",
+        (mbid, name.lower(), datetime.utcnow().isoformat(), lidarr_id, run_id),
     )
     conn.commit()
 
@@ -293,6 +296,16 @@ def listenbrainz_get(path: str, params: dict | None = None) -> dict:
             log.warning("ListenBrainz request failed (attempt %d): %s", attempt + 1, e)
             time.sleep(2 ** attempt)
     return {}
+
+
+def listenbrainz_post(path: str, body: dict) -> requests.Response:
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{LISTENBRAINZ_BASE}{path}"
+    headers = {"Content-Type": "application/json; charset=UTF-8"}
+    if LISTENBRAINZ_TOKEN:
+        headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
+    return requests.post(url, headers=headers, json=body, timeout=15)
 
 
 def get_top_artists(username: str, count: int, stats_range: str) -> list[dict]:
@@ -712,6 +725,11 @@ def run_discovery(config: dict | None = None) -> dict:
 
         # 6. Add each artist to Lidarr
         added_count = 0
+        cur = conn.execute(
+            "INSERT INTO runs (run_at, artists_added, status) VALUES (?,?,?)",
+            (datetime.utcnow().isoformat(), 0, "running"),
+        )
+        current_run_id = int(cur.lastrowid)
         for candidate in to_add:
             name = candidate["name"]
             score = candidate["score"]
@@ -725,7 +743,7 @@ def run_discovery(config: dict | None = None) -> dict:
             result = add_artist_to_lidarr(artist_data, quality_id, metadata_id, tag_id)
             if result and result.get("id"):
                 lidarr_id = result["id"]
-                record_added(conn, name, candidate["mbid"], lidarr_id)
+                record_added(conn, name, candidate["mbid"], lidarr_id, current_run_id)
                 log.info("Added '%s' to Lidarr (id=%d)", name, lidarr_id)
                 added_count += 1
             else:
@@ -734,8 +752,8 @@ def run_discovery(config: dict | None = None) -> dict:
             time.sleep(1)
 
         conn.execute(
-            "INSERT INTO runs (run_at, artists_added, status) VALUES (?,?,?)",
-            (datetime.utcnow().isoformat(), added_count, "ok"),
+            "UPDATE runs SET run_at = ?, artists_added = ?, status = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), added_count, "ok", current_run_id),
         )
         conn.commit()
         conn.close()
@@ -793,6 +811,20 @@ def _tail_log(lines: int) -> list[str]:
         return list(_log_buffer)[-lines:]
 
 
+def _next_run_at_iso(run_interval_seconds: int) -> str | None:
+    last = _get_last_run()
+    if not last:
+        return None
+    finished = last.get("finished_at")
+    if not finished or not isinstance(finished, str):
+        return None
+    try:
+        finished_dt = datetime.fromisoformat(finished)
+    except ValueError:
+        return None
+    return (finished_dt + timedelta(seconds=int(run_interval_seconds))).isoformat()
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -809,145 +841,743 @@ def create_app() -> Flask:
         # Keep this intentionally lightweight; API endpoints hold full data.
         return """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Music Discovery</title>
+  <title>Discovery Bridge</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 1000px; }
-    h1 { margin-bottom: 8px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
-    label { display: block; margin-top: 8px; font-size: 0.9rem; color: #444; }
-    input, select { width: 100%; padding: 6px; margin-top: 4px; }
-    button { margin-top: 10px; padding: 8px 10px; }
-    pre { background: #111; color: #ddd; padding: 10px; overflow: auto; max-height: 280px; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-    th, td { border-bottom: 1px solid #eee; padding: 6px; text-align: left; }
-    .muted { color: #666; font-size: 0.85rem; }
+    :root {
+      --bg: #0f0f13;
+      --surface: #16161d;
+      --surface2: #1c1c26;
+      --border: #2a2a36;
+      --text: #e8e6ed;
+      --muted: #8b8798;
+      --accent: #a855f7;
+      --accent-dim: #7c3aed;
+      --ok: #22c55e;
+      --warn: #eab308;
+      --err: #ef4444;
+      --radius: 10px;
+      --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+      --mono: "Cascadia Code", "Consolas", "Ubuntu Mono", ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 20px 48px; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px 20px;
+      margin-bottom: 20px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    header h1 span { color: var(--accent); }
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-left: auto;
+    }
+    .nav button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .nav button:hover { color: var(--text); border-color: #444; }
+    .nav button.active {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(168, 85, 247, 0.12);
+    }
+    .hint { color: var(--muted); font-size: 0.8rem; margin: 0; }
+    .panel { display: none; animation: fade 0.2s ease; }
+    .panel.active { display: block; }
+    @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .status-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .stat-pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+    }
+    .stat-pill .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .stat-pill .value { font-size: 1.1rem; font-weight: 600; margin-top: 4px; }
+    .pulse { animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+    .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .btn-primary {
+      background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+      border: none;
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: none;
+    }
+    .btn-primary.loading .spinner { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .stat-box {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .stat-box .n { font-size: 1.35rem; font-weight: 700; color: var(--accent); }
+    .stat-box .l { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+    table.data {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    table.data th, table.data td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    table.data th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    table.data tr.run-row { cursor: pointer; }
+    table.data tr.run-row:hover { background: rgba(168, 85, 247, 0.06); }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .badge-ok { background: rgba(34, 197, 94, 0.2); color: var(--ok); }
+    .badge-err { background: rgba(239, 68, 68, 0.2); color: var(--err); }
+    .badge-warn { background: rgba(234, 179, 8, 0.2); color: var(--warn); }
+    .badge-neu { background: rgba(139, 135, 152, 0.2); color: var(--muted); }
+    .expand-detail td {
+      background: var(--bg);
+      padding: 12px 16px;
+      font-size: 0.85rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .expand-detail ul { margin: 0; padding-left: 18px; }
+    .search {
+      width: 100%;
+      max-width: 320px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font: inherit;
+      margin-bottom: 14px;
+    }
+    .search::placeholder { color: var(--muted); }
+    .settings-section { margin-bottom: 28px; }
+    .settings-section h3 { margin: 0 0 14px; font-size: 0.95rem; color: var(--accent); }
+    .field { margin-bottom: 18px; }
+    .field label { display: block; font-weight: 600; margin-bottom: 6px; }
+    .field .desc { font-size: 0.82rem; color: var(--muted); margin: 0 0 8px; line-height: 1.45; }
+    .compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .compare small { display: block; color: var(--muted); font-size: 0.72rem; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .field input, .field select, .field textarea {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font: inherit;
+    }
+    .field textarea { min-height: 120px; font-family: var(--mono); font-size: 0.88rem; }
+    .mono { font-family: var(--mono); font-size: 0.85rem; }
+    .banner-warn {
+      background: rgba(234, 179, 8, 0.12);
+      border: 1px solid rgba(234, 179, 8, 0.35);
+      color: #facc15;
+      padding: 12px 14px;
+      border-radius: var(--radius);
+      margin-bottom: 16px;
+      font-size: 0.9rem;
+    }
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-weight: 500;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+      z-index: 1000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+    #toast.show { opacity: 1; pointer-events: auto; }
+    #toast.ok { background: var(--ok); color: #052e16; }
+    #toast.err { background: var(--err); color: #fff; }
   </style>
 </head>
 <body>
-  <h1>Music Discovery</h1>
-  <p class="muted">Use ?token=YOUR_TOKEN if DISCOVERY_GUI_TOKEN is enabled.</p>
+  <div class="wrap">
+    <header>
+      <h1>Music <span>Discovery</span> Bridge</h1>
+      <nav class="nav" id="mainNav">
+        <button type="button" data-tab="dash" class="active">Dashboard</button>
+        <button type="button" data-tab="artists">Artists</button>
+        <button type="button" data-tab="settings">Settings</button>
+        <button type="button" data-tab="loves">Seed Loves</button>
+      </nav>
+    </header>
+    <p class="hint">Auth: append <span class="mono">?token=…</span> when <span class="mono">DISCOVERY_GUI_TOKEN</span> is set.</p>
 
-  <div class="grid">
-    <div class="card">
-      <h3>Run</h3>
-      <button id="btnRun">Run discovery now</button>
-      <div id="runNote" class="muted"></div>
-      <h4>Last run</h4>
-      <pre id="lastRun"></pre>
-    </div>
-    <div class="card">
-      <h3>Settings</h3>
-      <form id="settingsForm">
-        <label>Seed mode
-          <select name="seeds_mode">
-            <option value="most_listened">most_listened</option>
-            <option value="loved">loved</option>
-            <option value="both">both</option>
-          </select>
-        </label>
-        <label>Top artists count <input name="top_artists_count" type="number" min="1"></label>
-        <label>Loved feedback count <input name="loved_feedback_count" type="number" min="1"></label>
-        <label>Stats range <input name="listenbrainz_stats_range"></label>
-        <label>Similar per artist <input name="similar_per_artist" type="number" min="1"></label>
-        <label>Max new artists <input name="max_new_artists" type="number" min="1"></label>
-        <label>Min similarity (0-1) <input name="min_similarity" type="number" step="0.01" min="0" max="1"></label>
-        <label>Run interval seconds <input name="run_interval_seconds" type="number" min="60"></label>
-        <label>Similar algorithm <input name="similar_algorithm"></label>
-        <button type="submit">Save settings</button>
+    <section id="panel-dash" class="panel active">
+      <div class="status-bar" id="dashStatus"></div>
+      <div class="row-actions">
+        <button type="button" class="btn-primary" id="btnRun">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="btnRunLabel">Run Now</span>
+        </button>
+      </div>
+      <div class="card">
+        <h2>Last run</h2>
+        <div class="stat-grid" id="lastRunStats"></div>
+      </div>
+      <div class="card">
+        <h2>Recent runs</h2>
+        <table class="data" id="runsTable">
+          <thead><tr><th>When</th><th>Status</th><th>Added</th></tr></thead>
+          <tbody id="runsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="panel-artists" class="panel">
+      <div class="card">
+        <h2>Artists added by discovery</h2>
+        <input type="search" class="search" id="artistSearch" placeholder="Filter by artist name…" autocomplete="off" />
+        <table class="data">
+          <thead><tr><th>Artist</th><th>Added</th><th>Lidarr</th><th>MusicBrainz</th></tr></thead>
+          <tbody id="artistsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="panel-settings" class="panel">
+      <form id="settingsForm" class="card">
+        <h2>Settings</h2>
+        <div class="settings-section">
+          <h3>Discovery tuning</h3>
+          <div class="field">
+            <label for="seeds_mode">Seed mode</label>
+            <p class="desc">Where seed artists come from: play history stats, your ListenBrainz loved tracks, or both combined.</p>
+            <div class="compare">
+              <div><small>Current</small><select name="seeds_mode" id="seeds_mode">
+                <option value="most_listened">most_listened</option>
+                <option value="loved">loved</option>
+                <option value="both">both</option>
+              </select></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="seeds_mode"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="top_artists_count">Top artists count</label>
+            <p class="desc">How many top artists to pull from ListenBrainz statistics when using most-listened seeds.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="top_artists_count" id="top_artists_count" type="number" min="1" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="top_artists_count"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="loved_feedback_count">Loved feedback count</label>
+            <p class="desc">Max loved recordings to read from ListenBrainz when building loved-artist seeds.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="loved_feedback_count" id="loved_feedback_count" type="number" min="1" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="loved_feedback_count"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="listenbrainz_stats_range">ListenBrainz stats range</label>
+            <p class="desc">Time window for top-artist stats (e.g. half_yearly, year, all_time).</p>
+            <div class="compare">
+              <div><small>Current</small><input name="listenbrainz_stats_range" id="listenbrainz_stats_range" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="listenbrainz_stats_range"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="similar_per_artist">Similar per artist</label>
+            <p class="desc">How many similar artists to fetch per seed artist from ListenBrainz Labs.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="similar_per_artist" id="similar_per_artist" type="number" min="1" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="similar_per_artist"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="max_new_artists">Max new artists</label>
+            <p class="desc">Cap on how many new artists to add to Lidarr in a single run.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="max_new_artists" id="max_new_artists" type="number" min="1" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="max_new_artists"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="min_similarity">Min similarity</label>
+            <p class="desc">Minimum Labs similarity score (0–1) for a candidate to be considered.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="min_similarity" id="min_similarity" type="number" step="0.01" min="0" max="1" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="min_similarity"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="similar_algorithm">Similar algorithm</label>
+            <p class="desc">ListenBrainz Labs algorithm id for the similar-artists endpoint.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="similar_algorithm" id="similar_algorithm" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="similar_algorithm"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="settings-section">
+          <h3>Scheduler</h3>
+          <div class="field">
+            <label for="run_interval_seconds">Run interval (seconds)</label>
+            <p class="desc">How long the background scheduler waits between automatic discovery runs.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="run_interval_seconds" id="run_interval_seconds" type="number" min="60" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="run_interval_seconds"></div></div>
+            </div>
+          </div>
+        </div>
+        <button type="submit" class="btn-primary">Save settings</button>
       </form>
-      <div id="saveNote" class="muted"></div>
-    </div>
-  </div>
+    </section>
 
-  <div class="card" style="margin-top:16px;">
-    <h3>Recent runs</h3>
-    <table><thead><tr><th>run_at</th><th>status</th><th>added</th></tr></thead><tbody id="runsBody"></tbody></table>
+    <section id="panel-loves" class="panel">
+      <div class="card">
+        <h2>Seed Loves</h2>
+        <div class="banner-warn" id="lovesTokenBanner" hidden>
+          ListenBrainz user token is not configured (<span class="mono">LISTENBRAINZ_TOKEN</span>). Loving tracks from this UI will not work until it is set.
+        </div>
+        <p class="desc" style="margin-top:0">
+          Submit tracks as &quot;loved&quot; on ListenBrainz to influence future discovery runs.
+          Loved tracks are used as seeds when seed mode includes <span class="mono">loved</span>.
+        </p>
+        <div class="field">
+          <label for="lovesText">Tracks (one per line)</label>
+          <p class="desc">Format: <span class="mono">Artist Name - Track Title</span>, or a single line with just the artist name (lookup may need both artist and title).</p>
+          <textarea id="lovesText" placeholder="Artist - Song&#10;Another Artist - Another Song"></textarea>
+        </div>
+        <button type="button" class="btn-primary" id="btnSubmitLoves">Submit</button>
+        <div style="margin-top:20px" id="lovesResultsWrap" hidden>
+          <h2 style="font-size:1rem;margin-bottom:10px">Results</h2>
+          <table class="data">
+            <thead><tr><th>Track</th><th>Result</th><th>Recording MBID</th></tr></thead>
+            <tbody id="lovesResultsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </div>
-  <div class="card" style="margin-top:16px;">
-    <h3>Recently added artists</h3>
-    <table><thead><tr><th>name</th><th>added_at</th><th>lidarr_id</th></tr></thead><tbody id="addedBody"></tbody></table>
-  </div>
-  <div class="card" style="margin-top:16px;">
-    <h3>Log tail</h3>
-    <button id="btnLog">Refresh log</button>
-    <pre id="logBox"></pre>
-  </div>
+  <div id="toast" role="status"></div>
 
   <script>
-    const token = new URLSearchParams(window.location.search).get('token') || '';
-    async function api(path, opts={}) {
-      const u = token ? `${path}${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : path;
-      return fetch(u, opts);
-    }
-    function fill(form, data) {
-      for (const [k,v] of Object.entries(data)) {
-        if (form.elements[k]) form.elements[k].value = v;
-      }
-    }
-    async function loadConfig() {
-      const r = await api('/api/config');
-      const j = await r.json();
-      fill(document.getElementById('settingsForm'), j.config || {});
-    }
-    async function loadLast() {
-      const r = await api('/api/last');
-      const j = await r.json();
-      document.getElementById('lastRun').textContent = JSON.stringify(j.last_run || {}, null, 2);
-    }
-    async function loadRuns() {
-      const r = await api('/api/runs?limit=25');
-      const j = await r.json();
-      document.getElementById('runsBody').innerHTML = (j.runs || [])
-        .map(x => `<tr><td>${x.run_at || ''}</td><td>${x.status || ''}</td><td>${x.artists_added ?? ''}</td></tr>`).join('');
-    }
-    async function loadAdded() {
-      const r = await api('/api/added?limit=60');
-      const j = await r.json();
-      document.getElementById('addedBody').innerHTML = (j.added || [])
-        .map(x => `<tr><td>${x.name || ''}</td><td>${x.added_at || ''}</td><td>${x.lidarr_id ?? ''}</td></tr>`).join('');
-    }
-    async function loadLog() {
-      const r = await api('/api/log?lines=200');
-      const j = await r.json();
-      document.getElementById('logBox').textContent = (j.lines || []).join('');
-    }
+(function () {
+  const token = new URLSearchParams(window.location.search).get('token') || '';
+  async function api(path, opts) {
+    opts = opts || {};
+    const u = token ? path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token) : path;
+    return fetch(u, opts);
+  }
 
-    document.getElementById('btnRun').onclick = async () => {
-      const note = document.getElementById('runNote');
-      note.textContent = 'Starting...';
-      const r = await api('/api/run', {method:'POST'});
-      const j = await r.json();
-      note.textContent = j.status || j.error || 'started';
-      setTimeout(loadLast, 1000);
-    };
+  function parseIso(s) {
+    if (!s || typeof s !== 'string') return null;
+    var d = Date.parse(s);
+    if (!isNaN(d)) return new Date(d);
+    try {
+      return new Date(s);
+    } catch (e) { return null; }
+  }
 
-    document.getElementById('settingsForm').onsubmit = async (ev) => {
-      ev.preventDefault();
-      const fd = new FormData(ev.target);
-      const payload = {};
-      for (const [k, v] of fd.entries()) payload[k] = v;
-      ['top_artists_count','loved_feedback_count','similar_per_artist','max_new_artists','run_interval_seconds']
-        .forEach(k => payload[k] = parseInt(payload[k], 10));
-      payload.min_similarity = parseFloat(payload.min_similarity);
-      const r = await api('/api/config', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(payload)
+  function formatRelative(iso) {
+    var t = parseIso(iso);
+    if (!t) return '—';
+    var sec = Math.round((Date.now() - t.getTime()) / 1000);
+    if (sec < 45) return 'just now';
+    if (sec < 3600) return Math.floor(sec / 60) + ' min ago';
+    if (sec < 86400) return Math.floor(sec / 3600) + ' hours ago';
+    if (sec < 604800) return Math.floor(sec / 86400) + ' days ago';
+    return t.toLocaleDateString();
+  }
+
+  function formatCountdown(iso) {
+    var t = parseIso(iso);
+    if (!t) return '—';
+    var ms = t.getTime() - Date.now();
+    if (ms <= 0) return 'due now';
+    var s = Math.floor(ms / 1000);
+    var d = Math.floor(s / 86400);
+    var h = Math.floor((s % 86400) / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var r = Math.floor(s % 60);
+    if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+    if (h > 0) return h + 'h ' + m + 'm ' + r + 's';
+    return m + 'm ' + r + 's';
+  }
+
+  function statusBadge(st) {
+    var s = (st || '').toLowerCase();
+    if (s === 'ok') return '<span class="badge badge-ok">ok</span>';
+    if (s === 'error') return '<span class="badge badge-err">error</span>';
+    if (s === 'no_candidates' || s === 'no_seeds' || s === 'busy') return '<span class="badge badge-warn">' + (st || '') + '</span>';
+    return '<span class="badge badge-neu">' + (st || '—') + '</span>';
+  }
+
+  var state = {
+    lidarrUrl: '',
+    nextRunAt: null,
+    artistsAll: [],
+    runArtistsCache: {},
+    countdownTimer: null,
+    statusTimer: null
+  };
+
+  function fillForm(form, data) {
+    if (!data) return;
+    Object.keys(data).forEach(function (k) {
+      var el = form.elements[k];
+      if (el && 'value' in el) el.value = data[k];
+    });
+  }
+
+  function renderDashStatus(s) {
+    var running = s && s.is_running;
+    var el = document.getElementById('dashStatus');
+    var modeLabel = running
+      ? '<span class="pulse">Running...</span>'
+      : 'Idle';
+    var nextIso = s && s.next_run_at;
+    state.nextRunAt = nextIso || null;
+    var lidarrN = s && typeof s.lidarr_artist_count === 'number' ? s.lidarr_artist_count : '—';
+    var totalN = s && typeof s.total_artists_added === 'number' ? s.total_artists_added : '—';
+    if (s && s.lidarr_url) state.lidarrUrl = s.lidarr_url;
+    var lbTok = s && s.listenbrainz_token_configured;
+    document.getElementById('lovesTokenBanner').hidden = !!lbTok;
+
+    el.innerHTML =
+      '<div class="stat-pill"><div class="label">Discovery</div><div class="value">' + modeLabel + '</div></div>' +
+      '<div class="stat-pill"><div class="label">Next run in</div><div class="value" id="countdownVal">' + formatCountdown(nextIso) + '</div></div>' +
+      '<div class="stat-pill"><div class="label">Lidarr artists</div><div class="value">' + lidarrN + '</div></div>' +
+      '<div class="stat-pill"><div class="label">Total added (DB)</div><div class="value">' + totalN + '</div></div>';
+
+    var btn = document.getElementById('btnRun');
+    btn.disabled = !!running;
+    btn.classList.toggle('loading', !!running);
+  }
+
+  function tickCountdown() {
+    var node = document.getElementById('countdownVal');
+    if (node && state.nextRunAt) node.textContent = formatCountdown(state.nextRunAt);
+  }
+
+  function statBox(label, val) {
+    var v = (val !== undefined && val !== null) ? val : '—';
+    return '<div class="stat-box"><div class="n">' + v + '</div><div class="l">' + label + '</div></div>';
+  }
+
+  function renderLastRun(last) {
+    var box = document.getElementById('lastRunStats');
+    if (!last) {
+      box.innerHTML = '<p class="hint">No run yet.</p>';
+      return;
+    }
+    box.innerHTML =
+      statBox('Seeds used', last.seeds_used) +
+      statBox('Candidates', last.candidates) +
+      statBox('Filtered', last.filtered) +
+      statBox('Artists added', last.artists_added);
+  }
+
+  function toggleRunDetail(runId, row) {
+    var next = row.nextElementSibling;
+    if (next && next.classList.contains('expand-detail')) {
+      next.remove();
+      return;
+    }
+    var open = document.querySelectorAll('tr.expand-detail');
+    open.forEach(function (r) { r.remove(); });
+    var tr = document.createElement('tr');
+    tr.className = 'expand-detail';
+    var td = document.createElement('td');
+    td.colSpan = 3;
+    td.innerHTML = 'Loading…';
+    tr.appendChild(td);
+    row.parentNode.insertBefore(tr, row.nextSibling);
+
+    if (state.runArtistsCache[runId]) {
+      td.innerHTML = renderArtistList(state.runArtistsCache[runId]);
+      return;
+    }
+    api('/api/runs/' + runId + '/artists').then(function (r) { return r.json(); }).then(function (j) {
+      var list = (j && j.artists) || [];
+      state.runArtistsCache[runId] = list;
+      td.innerHTML = renderArtistList(list);
+    }).catch(function () {
+      td.textContent = 'Failed to load artists.';
+    });
+  }
+
+  function renderArtistList(artists) {
+    if (!artists.length) return '<span class="hint">No artists linked to this run.</span>';
+    var ul = '<ul>';
+    artists.forEach(function (a) {
+      ul += '<li><strong>' + escapeHtml(a.name || '') + '</strong>' +
+        (a.lidarr_id != null ? ' · Lidarr ' + a.lidarr_id : '') + '</li>';
+    });
+    return ul + '</ul>';
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderRuns(runs) {
+    var tb = document.getElementById('runsBody');
+    tb.innerHTML = '';
+    (runs || []).forEach(function (x) {
+      var tr = document.createElement('tr');
+      tr.className = 'run-row';
+      var id = x.id;
+      tr.innerHTML =
+        '<td>' + formatRelative(x.run_at) + '</td>' +
+        '<td>' + statusBadge(x.status) + '</td>' +
+        '<td>' + (x.artists_added != null ? x.artists_added : '—') + '</td>';
+      tr.addEventListener('click', function () {
+        if (id != null) toggleRunDetail(id, tr);
       });
-      const j = await r.json();
-      document.getElementById('saveNote').textContent = j.ok ? 'Saved.' : (j.error || 'Error');
-      await loadConfig();
-    };
+      tb.appendChild(tr);
+    });
+  }
 
-    document.getElementById('btnLog').onclick = loadLog;
-    loadConfig(); loadLast(); loadRuns(); loadAdded(); loadLog();
-    setInterval(loadLast, 8000);
-    setInterval(loadRuns, 15000);
+  async function loadStatus() {
+    var r = await api('/api/status');
+    var s = await r.json();
+    renderDashStatus(s);
+    renderLastRun(s.last_run);
+  }
+
+  async function loadRuns() {
+    var r = await api('/api/runs?limit=25');
+    var j = await r.json();
+    renderRuns(j.runs);
+  }
+
+  function renderArtistsTable(rows) {
+    var q = (document.getElementById('artistSearch').value || '').trim().toLowerCase();
+    var filtered = rows.filter(function (a) {
+      return !q || (a.name && a.name.toLowerCase().indexOf(q) >= 0);
+    });
+    var base = state.lidarrUrl || '';
+    var tb = document.getElementById('artistsBody');
+    tb.innerHTML = filtered.map(function (x) {
+      var lid = x.lidarr_id != null
+        ? '<a href="' + escapeHtml(base + '/artist/' + x.lidarr_id) + '" target="_blank" rel="noopener">' + x.lidarr_id + '</a>'
+        : '—';
+      var mb = (x.mbid && String(x.mbid).trim())
+        ? '<a href="https://musicbrainz.org/artist/' + escapeHtml(x.mbid) + '" target="_blank" rel="noopener">artist</a>'
+        : '—';
+      return '<tr><td>' + escapeHtml(x.name || '') + '</td><td>' + formatRelative(x.added_at) + '</td><td>' + lid + '</td><td>' + mb + '</td></tr>';
+    }).join('');
+  }
+
+  async function loadArtists() {
+    var r = await api('/api/added?limit=500');
+    var j = await r.json();
+    state.artistsAll = j.added || [];
+    state.artistsAll.sort(function (a, b) {
+      var ta = parseIso(a.added_at); var tb = parseIso(b.added_at);
+      if (!ta || !tb) return 0;
+      return tb - ta;
+    });
+    renderArtistsTable(state.artistsAll);
+  }
+
+  async function loadConfig() {
+    var r = await api('/api/config');
+    var j = await r.json();
+    fillForm(document.getElementById('settingsForm'), j.config || {});
+    var def = j.defaults || {};
+    document.querySelectorAll('.env-val').forEach(function (node) {
+      var k = node.getAttribute('data-k');
+      if (k && def[k] !== undefined) node.textContent = String(def[k]);
+    });
+  }
+
+  function showToast(msg, ok) {
+    var t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = ok ? 'show ok' : 'show err';
+    setTimeout(function () { t.classList.remove('show'); }, 3200);
+  }
+
+  document.getElementById('mainNav').addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    var tab = btn.getAttribute('data-tab');
+    document.querySelectorAll('.nav button').forEach(function (b) { b.classList.toggle('active', b === btn); });
+    document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
+    document.getElementById('panel-' + tab).classList.add('active');
+    if (tab === 'artists') loadArtists();
+  });
+
+  document.getElementById('artistSearch').addEventListener('input', function () {
+    renderArtistsTable(state.artistsAll);
+  });
+
+  document.getElementById('btnRun').addEventListener('click', async function () {
+    var r = await api('/api/run', { method: 'POST' });
+    var j = await r.json();
+    if (r.status === 409) showToast(j.error || 'Already running', false);
+    else await loadStatus();
+  });
+
+  document.getElementById('settingsForm').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var fd = new FormData(ev.target);
+    var payload = {};
+    fd.forEach(function (v, k) { payload[k] = v; });
+    ['top_artists_count','loved_feedback_count','similar_per_artist','max_new_artists','run_interval_seconds'].forEach(function (k) {
+      payload[k] = parseInt(payload[k], 10);
+    });
+    payload.min_similarity = parseFloat(payload.min_similarity);
+    var r = await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    var j = await r.json();
+    if (j.ok) {
+      showToast('Settings saved.', true);
+      await loadConfig();
+    } else showToast(j.error || 'Save failed', false);
+  });
+
+  function parseLovesLines(text) {
+    var recs = [];
+    text.split(String.fromCharCode(10)).forEach(function (line) {
+      var t = line.trim();
+      if (!t) return;
+      var idx = t.indexOf(' - ');
+      if (idx < 0) recs.push({ artist: t, track: '' });
+      else recs.push({ artist: t.slice(0, idx).trim(), track: t.slice(idx + 3).trim() });
+    });
+    return recs;
+  }
+
+  document.getElementById('btnSubmitLoves').addEventListener('click', async function () {
+    var raw = document.getElementById('lovesText').value;
+    var recordings = parseLovesLines(raw);
+    if (!recordings.length) {
+      showToast('Add at least one line.', false);
+      return;
+    }
+    var r = await api('/api/listenbrainz/submit-loves', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recordings: recordings })
+    });
+    var j = await r.json();
+    var wrap = document.getElementById('lovesResultsWrap');
+    var tbody = document.getElementById('lovesResultsBody');
+    if (r.status === 400 && j.error === 'token_required') {
+      showToast('ListenBrainz token required.', false);
+      wrap.hidden = false;
+      tbody.innerHTML = '';
+      return;
+    }
+    wrap.hidden = false;
+    tbody.innerHTML = (j.results || []).map(function (row) {
+      var track = [row.artist, row.track].filter(Boolean).join(' — ') || '—';
+      var ok = row.status === 'ok';
+      var mbid = row.recording_mbid || '—';
+      return '<tr><td>' + escapeHtml(track) + '</td><td>' +
+        (ok ? '<span class="badge badge-ok">submitted</span>' : '<span class="badge badge-err">failed</span>') +
+        '</td><td class="mono">' + escapeHtml(String(mbid)) + '</td></tr>';
+    }).join('');
+    showToast('Done: ' + (j.submitted || 0) + ' ok, ' + (j.failed || 0) + ' failed', (j.failed || 0) === 0);
+  });
+
+  state.statusTimer = setInterval(loadStatus, 5000);
+  state.countdownTimer = setInterval(tickCountdown, 1000);
+  loadStatus();
+  loadRuns();
+  loadConfig();
+  setInterval(loadRuns, 15000);
+})();
   </script>
 </body>
 </html>
@@ -955,7 +1585,9 @@ def create_app() -> Flask:
 
     @app.get("/api/config")
     def api_config_get():
-        return jsonify({"config": _coerce_settings(effective_settings())})
+        cfg = _coerce_settings(effective_settings())
+        defaults = _coerce_settings(dict(DEFAULT_SETTINGS))
+        return jsonify({"config": cfg, "defaults": defaults})
 
     @app.post("/api/config")
     def api_config_set():
@@ -980,6 +1612,117 @@ def create_app() -> Flask:
     def api_last():
         return jsonify({"last_run": _get_last_run()})
 
+    @app.get("/api/status")
+    def api_status():
+        cfg = _coerce_settings(effective_settings())
+        interval = int(cfg["run_interval_seconds"])
+        conn = init_db()
+        total_added = conn.execute("SELECT COUNT(*) FROM added_artists").fetchone()[0]
+        conn.close()
+        return jsonify(
+            {
+                "is_running": _run_lock.locked(),
+                "next_run_at": _next_run_at_iso(interval),
+                "last_run": _get_last_run(),
+                "lidarr_artist_count": len(get_lidarr_artist_names()),
+                "total_artists_added": int(total_added),
+                "lidarr_url": LIDARR_URL.rstrip("/"),
+                "listenbrainz_token_configured": bool(LISTENBRAINZ_TOKEN),
+            }
+        )
+
+    @app.get("/api/runs/<int:run_id>/artists")
+    def api_run_artists(run_id: int):
+        conn = init_db()
+        try:
+            exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if not exists:
+                return jsonify({"error": "not_found"}), 404
+            rows = conn.execute(
+                "SELECT name, mbid, added_at, lidarr_id, run_id FROM added_artists WHERE run_id = ? ORDER BY added_at ASC",
+                (run_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return jsonify(
+            {
+                "artists": [
+                    {"name": r[0], "mbid": r[1], "added_at": r[2], "lidarr_id": r[3], "run_id": r[4]}
+                    for r in rows
+                ]
+            }
+        )
+
+    @app.post("/api/listenbrainz/submit-loves")
+    def api_listenbrainz_submit_loves():
+        if not LISTENBRAINZ_TOKEN:
+            return jsonify({"error": "token_required"}), 400
+        body = request.get_json(silent=True) or {}
+        raw_list = body.get("recordings")
+        if not isinstance(raw_list, list):
+            return jsonify({"error": "invalid_json", "message": "recordings must be a list"}), 400
+
+        submitted = 0
+        failed = 0
+        results: list[dict] = []
+
+        for item in raw_list:
+            if not isinstance(item, dict):
+                failed += 1
+                results.append({"status": "failed", "error": "invalid_item"})
+                continue
+            artist = item.get("artist")
+            track = item.get("track")
+            mbid_raw = item.get("mbid")
+            artist_s = artist.strip() if isinstance(artist, str) else ""
+            track_s = track.strip() if isinstance(track, str) else ""
+            mbid = mbid_raw.strip() if isinstance(mbid_raw, str) else ""
+            base = {"artist": artist_s or None, "track": track_s or None}
+
+            recording_mbid = mbid or None
+            if not recording_mbid:
+                if not artist_s or not track_s:
+                    failed += 1
+                    results.append({**base, "status": "failed", "error": "missing_artist_or_track"})
+                    continue
+                lookup = listenbrainz_get(
+                    "/1/metadata/lookup",
+                    params={"artist_name": artist_s, "recording_name": track_s},
+                )
+                recording_mbid = (lookup.get("recording_mbid") or "").strip() or None
+                if not recording_mbid:
+                    failed += 1
+                    results.append({**base, "status": "failed", "error": "recording_not_found"})
+                    continue
+
+            r = listenbrainz_post(
+                "/1/feedback/recording-feedback",
+                {"recording_mbid": recording_mbid, "score": 1},
+            )
+            _respect_listenbrainz_rate_limit_headers(r)
+            if r.status_code == 200:
+                submitted += 1
+                results.append(
+                    {**base, "status": "ok", "recording_mbid": recording_mbid}
+                )
+            else:
+                failed += 1
+                try:
+                    detail = r.json()
+                except Exception:
+                    detail = {"detail": r.text}
+                results.append(
+                    {
+                        **base,
+                        "status": "failed",
+                        "error": "feedback_rejected",
+                        "http_status": r.status_code,
+                        "detail": detail,
+                    }
+                )
+
+        return jsonify({"submitted": submitted, "failed": failed, "results": results})
+
     @app.get("/api/runs")
     def api_runs():
         try:
@@ -988,14 +1731,14 @@ def create_app() -> Flask:
             limit = 50
         conn = init_db()
         rows = conn.execute(
-            "SELECT run_at, artists_added, status FROM runs ORDER BY id DESC LIMIT ?",
+            "SELECT id, run_at, artists_added, status FROM runs ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
         conn.close()
         return jsonify(
             {
                 "runs": [
-                    {"run_at": r[0], "artists_added": r[1], "status": r[2]}
+                    {"id": r[0], "run_at": r[1], "artists_added": r[2], "status": r[3]}
                     for r in rows
                 ]
             }
@@ -1004,7 +1747,7 @@ def create_app() -> Flask:
     @app.get("/api/added")
     def api_added():
         try:
-            limit = max(1, min(200, int(request.args.get("limit", "80"))))
+            limit = max(1, min(500, int(request.args.get("limit", "80"))))
         except ValueError:
             limit = 80
         conn = init_db()
