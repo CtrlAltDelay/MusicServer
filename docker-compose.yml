@@ -32,6 +32,16 @@ services:
     volumes:
       - /opt/music/slskd:/app
       - /data/slskd:/downloads
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O- http://127.0.0.1:5030/health >/dev/null || exit 1",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # ── Lidarr ↔ Soulseek bridge (polls wanted, searches slskd, triggers import) ─
   soularr:
@@ -47,8 +57,20 @@ services:
       - /data/slskd:/downloads
       - /opt/music/soularr:/data
     depends_on:
-      - lidarr
-      - slskd
+      lidarr:
+        condition: service_healthy
+      slskd:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "ps aux | grep -qE '[/]app/run.sh|[p]ython.*soularr\\.py' || exit 1",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── Music collection manager ────────────────────────────────────────────────
   lidarr:

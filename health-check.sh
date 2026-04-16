@@ -9,6 +9,7 @@
 #   - Docker container status
 #   - HTTP reachability of each service
 #   - Lidarr queue and disk space
+#   - Stale Soulseek incomplete downloads (> 48h)
 #   - Discovery bridge last run info
 #   - Tailscale connectivity
 # =============================================================================
@@ -151,7 +152,39 @@ for path in /data/music /data/slskd; do
     fi
 done
 
-# ── 5. Discovery bridge ───────────────────────────────────────────────────────
+# ── 5. Stale Downloads (slskd incomplete staging) ───────────────────────────
+hdr "Stale Downloads"
+SLSKD_INCOMPLETE="/data/slskd/.incomplete"
+STALE_MINUTES=$((48 * 60))
+if [[ ! -d "$SLSKD_INCOMPLETE" ]]; then
+    warn "$SLSKD_INCOMPLETE — directory not found (skipping)"
+else
+    mapfile -t _stale_paths < <(
+        find "$SLSKD_INCOMPLETE" -mindepth 1 \( -type f -o -type d \) -mmin +"$STALE_MINUTES" 2>/dev/null
+    )
+    stale_n="${#_stale_paths[@]}"
+    if [[ "$stale_n" -eq 0 ]]; then
+        ok "No entries under $SLSKD_INCOMPLETE older than 48 hours"
+    else
+        warn "$stale_n path(s) under $SLSKD_INCOMPLETE older than 48 hours (mtime)"
+        for p in "${_stale_paths[@]:0:15}"; do
+            echo -e "  ${YELLOW}!${NC} $p"
+        done
+        if [[ "$stale_n" -gt 15 ]]; then
+            echo -e "  ${YELLOW}!${NC} … and $((stale_n - 15)) more"
+        fi
+    fi
+    echo ""
+    echo "  To preview the same set:"
+    echo "    find \"$SLSKD_INCOMPLETE\" -mindepth 1 \\( -type f -o -type d \\) -mmin +$STALE_MINUTES -print"
+    echo ""
+    echo "  After reviewing, you can prune with find -delete (see commented examples at end of health-check.sh)."
+fi
+
+# Stale slskd incomplete cleanup (uncomment after verifying paths reported above):
+# find "/data/slskd/.incomplete" -mindepth 1 -depth \( -type f -o -type d \) -mmin $((48 * 60)) -delete
+
+# ── 6. Discovery bridge ───────────────────────────────────────────────────────
 hdr "Discovery Bridge"
 if [[ -f "$DISCOVERY_DB" ]]; then
     last_run=$(sqlite3 "$DISCOVERY_DB" \
@@ -179,7 +212,7 @@ else
     warn "Has the bridge run at least once? Check: docker logs music-discovery"
 fi
 
-# ── 6. Tailscale ─────────────────────────────────────────────────────────────
+# ── 7. Tailscale ─────────────────────────────────────────────────────────────
 hdr "Tailscale"
 if command -v tailscale &>/dev/null; then
     ts_status=$(tailscale status --json 2>/dev/null \

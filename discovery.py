@@ -6,43 +6,49 @@ Pulls your top artists from ListenBrainz, finds similar artists,
 and automatically adds new ones to Lidarr for download.
 
 Flow:
-  1. Fetch your top artists from ListenBrainz stats (half-yearly window)
-  2. For each top artist with a MusicBrainz ID, get similar artists (Labs API)
-  3. Score candidates by similarity + how many of your artists link to them
+  1. Fetch seed artists (top / loved from ListenBrainz); resolve missing MBIDs via metadata lookup when possible
+  2. For each seed with a MusicBrainz ID, get similar artists (Labs API)
+  3. Score candidates by similarity + how many of your seeds link to them
   4. Filter out artists already in Lidarr
-  5. Add the top N new artists to Lidarr, tagged as "discovered"
+  5. Add new artists to Lidarr (top N−1 by score plus one random pick from the next 10 ranked), tagged "discovered"
   6. Trigger Lidarr to search for their latest album
 """
 
 import json
 import os
+import random
 import threading
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import sqlite3
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 import requests
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DISCOVERY_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+APP_ROOT = Path(__file__).resolve().parent
 DB_PATH = str(DATA_DIR / "discovery.db")
 SETTINGS_PATH = DATA_DIR / "settings.json"
 LOG_PATH = DATA_DIR / "discovery.log"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_PATH),
-    ],
+_log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_file_handler = RotatingFileHandler(
+    LOG_PATH,
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
 )
+_file_handler.setFormatter(_log_fmt)
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_stream_handler, _file_handler])
 log = logging.getLogger("discovery")
 
 # ── Config (from environment variables) ──────────────────────────────────────
@@ -308,6 +314,96 @@ def listenbrainz_post(path: str, body: dict) -> requests.Response:
     return requests.post(url, headers=headers, json=body, timeout=15)
 
 
+def listenbrainz_post_json(path: str, body: dict) -> dict | list | None:
+    """POST main ListenBrainz API with 429 retries and rate-limit header handling."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{LISTENBRAINZ_BASE}{path}"
+    headers = {"Content-Type": "application/json; charset=UTF-8"}
+    if LISTENBRAINZ_TOKEN:
+        headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
+
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=20)
+            if r.status_code == 429:
+                reset = r.headers.get("X-RateLimit-Reset-In") or r.headers.get("Retry-After")
+                try:
+                    wait = float(reset) + 1 if reset else 2**attempt
+                except (TypeError, ValueError):
+                    wait = 2**attempt
+                log.warning("ListenBrainz POST rate limited, sleeping %.1fs", min(wait, 120))
+                time.sleep(min(wait, 120))
+                continue
+            if r.status_code >= 400:
+                log.warning(
+                    "ListenBrainz POST %s failed: %s %s",
+                    path,
+                    r.status_code,
+                    (r.text or "")[:200],
+                )
+                return None
+            _respect_listenbrainz_rate_limit_headers(r)
+            return r.json()
+        except Exception as e:
+            log.warning("ListenBrainz POST %s failed (attempt %d): %s", path, attempt + 1, e)
+            time.sleep(2**attempt)
+    return None
+
+
+def fill_missing_artist_mbids(artists: list[dict], context: str) -> None:
+    """
+    Resolve empty artist MBIDs using POST /1/metadata/lookup/ (requires LISTENBRAINZ_TOKEN).
+    Mutates each artist dict in place. Uses a placeholder recording name so the mapper can
+    still return artist_mbids when possible.
+    """
+    if not LISTENBRAINZ_TOKEN:
+        return
+
+    pending: list[tuple[int, str]] = []
+    for i, a in enumerate(artists):
+        name = (a.get("name") or "").strip()
+        mbid = (a.get("mbid") or "").strip()
+        if name and not mbid:
+            pending.append((i, name))
+
+    if not pending:
+        return
+
+    batch_size = 25
+    for off in range(0, len(pending), batch_size):
+        chunk = pending[off : off + batch_size]
+        recordings = [{"artist_name": nm, "recording_name": "Unknown"} for _, nm in chunk]
+        data = listenbrainz_post_json("/1/metadata/lookup/", {"recordings": recordings})
+        if data is None:
+            continue
+        if not isinstance(data, list):
+            log.warning("metadata/lookup: expected list response, got %s", type(data).__name__)
+            continue
+        if len(data) != len(chunk):
+            log.warning(
+                "metadata/lookup: response length %d != request %d; pairing by position",
+                len(data),
+                len(chunk),
+            )
+        for (idx, seed_name), item in zip(chunk, data):
+            if not isinstance(item, dict):
+                continue
+            mbids = item.get("artist_mbids")
+            if not mbids or not isinstance(mbids, list):
+                continue
+            resolved = (mbids[0] or "").strip() if isinstance(mbids[0], str) else ""
+            if not resolved:
+                continue
+            artists[idx]["mbid"] = resolved
+            log.info(
+                "Recovered MBID for %r via ListenBrainz metadata lookup (%s)",
+                seed_name,
+                context,
+            )
+        time.sleep(0.25)
+
+
 def get_top_artists(username: str, count: int, stats_range: str) -> list[dict]:
     """
     Return user's top artists as [{"name": ..., "mbid": ..., "listen_count": int}, ...]
@@ -330,6 +426,7 @@ def get_top_artists(username: str, count: int, stats_range: str) -> list[dict]:
         if name:
             artists.append({"name": name, "mbid": mbid, "listen_count": lc})
     log.info("Fetched %d top artists for user '%s'", len(artists), username)
+    fill_missing_artist_mbids(artists, "top artists")
     return artists
 
 
@@ -386,6 +483,7 @@ def get_loved_artists(username: str, limit: int) -> list[dict]:
                 timeout=15,
             )
             r.raise_for_status()
+            _respect_listenbrainz_rate_limit_headers(r)
             meta = r.json()
         except Exception as e:
             log.warning("Metadata lookup failed for chunk starting at %d: %s", i, e)
@@ -413,6 +511,8 @@ def get_loved_artists(username: str, limit: int) -> list[dict]:
                     "listen_count": 1,
                 }
         time.sleep(0.5)
+
+    fill_missing_artist_mbids(list(artist_counts.values()), "loved artists")
 
     result = sorted(artist_counts.values(), key=lambda x: x["listen_count"], reverse=True)
     log.info("Resolved %d unique artists from loved recordings", len(result))
@@ -615,6 +715,39 @@ def build_candidate_pool(
     return candidates
 
 
+def select_candidates_with_diversity_jump(
+    ranked: list[dict], max_new_artists: int
+) -> list[dict]:
+    """
+    Select up to max_new_artists candidates: the top (max_new_artists - 1) by compound score,
+    then one slot filled uniformly at random from the next 10 entries in the ranked list
+    (still pre-filtered by MIN_SIMILARITY). If there is no diversity pool, fall back to
+    plain top-N.
+    """
+    if max_new_artists <= 0 or not ranked:
+        return []
+    if max_new_artists == 1 or len(ranked) <= max_new_artists:
+        return ranked[:max_new_artists]
+
+    head = ranked[: max_new_artists - 1]
+    pool = ranked[max_new_artists - 1 : max_new_artists - 1 + 10]
+    if not pool:
+        return ranked[:max_new_artists]
+
+    pick = random.choice(pool)
+    first_rank = max_new_artists
+    last_rank = max_new_artists + len(pool) - 1
+    log.info(
+        'Diversity jump: selected "%s" (score=%.3f) at random from ranked positions %d–%d (%d candidates)',
+        pick["name"],
+        float(pick.get("score", 0.0)),
+        first_rank,
+        last_rank,
+        len(pool),
+    )
+    return head + [pick]
+
+
 def run_discovery(config: dict | None = None) -> dict:
     cfg = _coerce_settings(config or effective_settings())
     mode = cfg["seeds_mode"]
@@ -697,9 +830,9 @@ def run_discovery(config: dict | None = None) -> dict:
         }
         log.info("Candidates after filtering: %d", len(filtered))
 
-        # 4. Sort by score, take top N
+        # 4. Sort by score; top (N-1) by compound score plus one diversity slot from the next 10
         ranked = sorted(filtered.values(), key=lambda x: x["score"], reverse=True)
-        to_add = ranked[: int(cfg["max_new_artists"])]
+        to_add = select_candidates_with_diversity_jump(ranked, int(cfg["max_new_artists"]))
 
         if not to_add:
             status = "no_candidates"
@@ -836,6 +969,14 @@ def create_app() -> Flask:
             return None
         return jsonify({"error": "unauthorized"}), 401
 
+    @app.get("/icon.png")
+    def icon_png():
+        return send_from_directory(APP_ROOT, "icon.png", mimetype="image/png")
+
+    @app.get("/favicon.ico")
+    def favicon():
+        return send_from_directory(APP_ROOT, "icon.png", mimetype="image/png")
+
     @app.get("/")
     def index():
         # Keep this intentionally lightweight; API endpoints hold full data.
@@ -846,6 +987,7 @@ def create_app() -> Flask:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Discovery Bridge</title>
+  <link rel="icon" href="/icon.png" type="image/png" />
   <style>
     :root {
       --bg: #0f0f13;
@@ -1244,6 +1386,12 @@ def create_app() -> Flask:
   <script>
 (function () {
   const token = new URLSearchParams(window.location.search).get('token') || '';
+  (function syncIconToken() {
+    var link = document.querySelector('link[rel="icon"]');
+    if (link && token) {
+      link.setAttribute('href', '/icon.png?token=' + encodeURIComponent(token));
+    }
+  })();
   async function api(path, opts) {
     opts = opts || {};
     const u = token ? path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token) : path;

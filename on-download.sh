@@ -17,6 +17,10 @@ NAVIDROME_URL="${NAVIDROME_URL:-http://navidrome:4533}"
 NAVIDROME_USER="${NAVIDROME_USER:-admin}"
 NAVIDROME_PASS="${NAVIDROME_PASS:-}"   # set in Lidarr's env or hardcode here
 
+# Debounce overlapping rescans when Lidarr fires many imports at once (flock + short cooldown)
+NAVIDROME_SCAN_LOCK="${NAVIDROME_SCAN_LOCK:-/tmp/navidrome_scan.lock}"
+NAVIDROME_SCAN_DEBOUNCE_SLEEP="${NAVIDROME_SCAN_DEBOUNCE_SLEEP:-3}"
+
 # Lidarr passes event type via environment
 EVENT_TYPE="${lidarr_eventtype:-}"
 
@@ -34,6 +38,17 @@ ARTIST="${lidarr_artist_name:-unknown artist}"
 ALBUM="${lidarr_album_title:-unknown album}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Triggering Navidrome rescan after import: $ARTIST — $ALBUM"
+
+if [[ -z "${NAVIDROME_PASS}" ]]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Warning: NAVIDROME_PASS is empty; refusing to call Navidrome without credentials." >&2
+    exit 1
+fi
+
+exec {navidrome_scan_lock_fd}>"${NAVIDROME_SCAN_LOCK}"
+if ! flock -n "$navidrome_scan_lock_fd"; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Debounced: another Navidrome rescan is in progress or cooling down; skipping this hook."
+    exit 0
+fi
 
 # Navidrome exposes a scan endpoint via its Subsonic API
 SCAN_URL="$NAVIDROME_URL/rest/startScan.view"
@@ -53,5 +68,8 @@ else
     # Non-fatal — the hourly scan will catch it anyway
     echo "Warning: could not trigger Navidrome scan. Response: $response"
 fi
+
+# Hold the lock briefly so burst imports coalesce into one scan trigger
+sleep "${NAVIDROME_SCAN_DEBOUNCE_SLEEP}"
 
 exit 0
