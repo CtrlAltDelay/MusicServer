@@ -1,0 +1,4 @@
+# Library prune: unmonitor untapped "discovered" artists (env from /app/cron-env.json)
+PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin
+SHELL=/bin/sh
+15 4 * * * root /usr/local/bin/python3 /app/_prune_cron_entry.py
