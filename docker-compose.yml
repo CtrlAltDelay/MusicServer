@@ -142,14 +142,14 @@ services:
       LIDARR_URL: http://lidarr:8686
       LIDARR_API_KEY: ${LIDARR_API_KEY}
       LIDARR_ROOT_PATH: /music
-      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-loved}  # most_listened | loved | both
+      DISCOVERY_SEED_MODE: ${DISCOVERY_SEED_MODE:-mood}  # mood | most_listened | loved | both
       LOVED_FEEDBACK_COUNT: "200"
       TOP_ARTISTS_COUNT: "20"
       SIMILAR_PER_ARTIST: "10"
       MAX_NEW_ARTISTS: "5"
-      MIN_SIMILARITY: "0.25"
+      MIN_SIMILARITY: "0.7"
       RUN_INTERVAL_SECONDS: "86400"
-      LISTENBRAINZ_STATS_RANGE: ${LISTENBRAINZ_STATS_RANGE:-half_yearly}
+      LISTENBRAINZ_STATS_RANGE: ${LISTENBRAINZ_STATS_RANGE:-quarterly}
       DISCOVERY_GUI_PORT: "8765"
       DISCOVERY_GUI_TOKEN: ${DISCOVERY_GUI_TOKEN:-}
     volumes:

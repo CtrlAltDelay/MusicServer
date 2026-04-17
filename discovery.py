@@ -2,21 +2,22 @@
 """
 Music Discovery Bridge
 ======================
-Pulls your top artists from ListenBrainz, finds similar artists,
+Pulls seed artists from ListenBrainz (mood/recent tiers, loved, or stats), finds similar artists,
 and automatically adds new ones to Lidarr for download.
 
 Flow:
-  1. Fetch seed artists (top / loved from ListenBrainz); resolve missing MBIDs via metadata lookup when possible
-  2. For each seed with a MusicBrainz ID, get similar artists (Labs API)
-  3. Score candidates by similarity + how many of your seeds link to them
-  4. Filter out artists already in Lidarr
-  5. Add new artists to Lidarr (top N−1 by score plus one random pick from the next 10 ranked), tagged "discovered"
-  6. Trigger Lidarr to search for their latest album
+  1. Fetch seed artists; mood mode uses Daily Jams / recent listens + monthly stats + optional year/all_time fallback
+  2. For each seed with a MusicBrainz ID, get similar artists (Labs API); tier-1 seeds boost similarity weight
+  3. Score candidates; enforce MIN_SIMILARITY on raw Labs match; optional MusicBrainz catalog gate before add
+  4. Filter out artists already in Lidarr (name + MBID)
+  5. Add new artists (top N−1 by score plus one random pick from the next 10 ranked), tags discovered / mood-discovery
+  6. Monitor latest album and search for missing albums
 """
 
 import json
 import os
 import random
+import re
 import threading
 import time
 import logging
@@ -64,21 +65,34 @@ DISCOVERY_GUI_PORT = int(os.environ.get("DISCOVERY_GUI_PORT", "8765"))
 
 LISTENBRAINZ_BASE = "https://api.listenbrainz.org"
 LISTENBRAINZ_LABS_BASE = "https://labs.api.listenbrainz.org"
+MUSICBRAINZ_WS_BASE = "https://musicbrainz.org/ws/2"
+
+# MusicBrainz "Various Artists" artist id
+VARIOUS_ARTISTS_MBID = "89ad4ac3-39f7-4e6b-8d32-6b5d032ffee6"
+
+MUSICBRAINZ_USER_AGENT = os.environ.get(
+    "MUSICBRAINZ_USER_AGENT",
+    "music-discovery-bridge/1.0 ( https://github.com/metabrainz/musicbrainz-server )",
+)
 
 DEFAULT_SETTINGS = {
-    # "most_listened" (stats), "loved" (hearted tracks), "both" (combined)
-    "seeds_mode": os.environ.get("DISCOVERY_SEED_MODE", os.environ.get("DISCOVERY_SOURCE", "loved")),
+    # "mood" (tiered), "most_listened" (stats), "loved" (hearted tracks), "both" (combined)
+    "seeds_mode": os.environ.get("DISCOVERY_SEED_MODE", os.environ.get("DISCOVERY_SOURCE", "mood")),
     "top_artists_count": int(os.environ.get("TOP_ARTISTS_COUNT", "20")),
     "loved_feedback_count": int(os.environ.get("LOVED_FEEDBACK_COUNT", os.environ.get("LOVED_TRACKS_LIMIT", "200"))),
-    "listenbrainz_stats_range": os.environ.get("LISTENBRAINZ_STATS_RANGE", "half_yearly"),
+    "listenbrainz_stats_range": os.environ.get("LISTENBRAINZ_STATS_RANGE", "quarterly"),
     "similar_per_artist": int(os.environ.get("SIMILAR_PER_ARTIST", "10")),
     "max_new_artists": int(os.environ.get("MAX_NEW_ARTISTS", "5")),
-    "min_similarity": float(os.environ.get("MIN_SIMILARITY", "0.25")),
+    "min_similarity": float(os.environ.get("MIN_SIMILARITY", "0.7")),
     "run_interval_seconds": int(os.environ.get("RUN_INTERVAL_SECONDS", str(24 * 60 * 60))),
     "similar_algorithm": os.environ.get(
         "LISTENBRAINZ_SIMILAR_ALGORITHM",
         "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30",
     ),
+    "mood_min_seed_mbids": int(os.environ.get("MOOD_MIN_SEED_MBIDS", "5")),
+    "recent_listens_days": int(os.environ.get("RECENT_LISTENS_DAYS", "7")),
+    "daily_jams_title_substring": os.environ.get("DAILY_JAMS_TITLE_SUBSTRING", "daily jam"),
+    "tier1_similarity_multiplier": float(os.environ.get("TIER1_SIMILARITY_MULTIPLIER", "1.5")),
 }
 
 _settings_lock = threading.Lock()
@@ -157,8 +171,8 @@ def _coerce_settings(raw: dict) -> dict:
     mode = str(raw.get("seeds_mode", DEFAULT_SETTINGS["seeds_mode"])).lower()
     if mode == "top":
         mode = "most_listened"
-    if mode not in ("most_listened", "loved", "both"):
-        mode = "most_listened"
+    if mode not in ("mood", "most_listened", "loved", "both"):
+        mode = "mood"
     out["seeds_mode"] = mode
 
     def _as_int(key: str, default: int, lower: int = 1, upper: int = 10_000) -> int:
@@ -185,6 +199,20 @@ def _coerce_settings(raw: dict) -> dict:
         "run_interval_seconds", DEFAULT_SETTINGS["run_interval_seconds"], 60, 86400 * 14
     )
     out["min_similarity"] = _as_float_01("min_similarity", float(DEFAULT_SETTINGS["min_similarity"]))
+
+    out["mood_min_seed_mbids"] = _as_int(
+        "mood_min_seed_mbids", DEFAULT_SETTINGS["mood_min_seed_mbids"], 1, 100
+    )
+    out["recent_listens_days"] = _as_int(
+        "recent_listens_days", DEFAULT_SETTINGS["recent_listens_days"], 1, 90
+    )
+    djs = str(raw.get("daily_jams_title_substring", DEFAULT_SETTINGS["daily_jams_title_substring"])).strip()
+    out["daily_jams_title_substring"] = djs[:200] if djs else DEFAULT_SETTINGS["daily_jams_title_substring"]
+    try:
+        tm = float(raw.get("tier1_similarity_multiplier", DEFAULT_SETTINGS["tier1_similarity_multiplier"]))
+    except (TypeError, ValueError):
+        tm = float(DEFAULT_SETTINGS["tier1_similarity_multiplier"])
+    out["tier1_similarity_multiplier"] = max(1.0, min(5.0, tm))
 
     ranges = {
         "week",
@@ -270,7 +298,7 @@ def listenbrainz_get(path: str, params: dict | None = None) -> dict:
     if LISTENBRAINZ_TOKEN:
         headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             r = requests.get(url, params=params or {}, headers=headers, timeout=15)
             if r.status_code == 429:
@@ -281,6 +309,16 @@ def listenbrainz_get(path: str, params: dict | None = None) -> dict:
                     wait = 2 ** attempt
                 log.warning("ListenBrainz rate limited, sleeping %.1fs", min(wait, 120))
                 time.sleep(min(wait, 120))
+                continue
+            if r.status_code in (502, 503):
+                wait = min(float(2**attempt), 120.0)
+                log.warning(
+                    "ListenBrainz GET %s returned %s; exponential backoff %.1fs",
+                    path,
+                    r.status_code,
+                    wait,
+                )
+                time.sleep(wait)
                 continue
             if r.status_code == 204:
                 log.warning("ListenBrainz returned 204 (no statistics yet for this user/range).")
@@ -323,7 +361,7 @@ def listenbrainz_post_json(path: str, body: dict) -> dict | list | None:
     if LISTENBRAINZ_TOKEN:
         headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             r = requests.post(url, headers=headers, json=body, timeout=20)
             if r.status_code == 429:
@@ -334,6 +372,16 @@ def listenbrainz_post_json(path: str, body: dict) -> dict | list | None:
                     wait = 2**attempt
                 log.warning("ListenBrainz POST rate limited, sleeping %.1fs", min(wait, 120))
                 time.sleep(min(wait, 120))
+                continue
+            if r.status_code in (502, 503):
+                wait = min(float(2**attempt), 120.0)
+                log.warning(
+                    "ListenBrainz POST %s returned %s; exponential backoff %.1fs",
+                    path,
+                    r.status_code,
+                    wait,
+                )
+                time.sleep(wait)
                 continue
             if r.status_code >= 400:
                 log.warning(
@@ -519,6 +567,284 @@ def get_loved_artists(username: str, limit: int) -> list[dict]:
     return result
 
 
+_MBID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def _first_mbid_in_string(s: str) -> str:
+    if not s:
+        return ""
+    m = _MBID_RE.search(s)
+    return m.group(0).lower() if m else ""
+
+
+def _find_daily_jams_playlist_mbid(username: str, title_substring: str) -> str:
+    """Return playlist MBID from created-for playlists whose title matches, or ''."""
+    needle = (title_substring or "").lower().strip()
+    if not needle:
+        return ""
+    offset = 0
+    page = 80
+    while offset < 400:
+        path = f"/1/user/{quote(username, safe='')}/playlists/createdfor"
+        data = listenbrainz_get(path, params={"count": page, "offset": offset})
+        playlists = data.get("playlists") or []
+        if not playlists:
+            break
+        for pl in playlists:
+            if not isinstance(pl, dict):
+                continue
+            if isinstance(pl.get("playlist"), dict):
+                pl = pl["playlist"]
+            title = (pl.get("title") or "").lower()
+            if needle not in title:
+                continue
+            ident = pl.get("identifier") or ""
+            if isinstance(ident, list) and ident:
+                ident = ident[0]
+            mbid = _first_mbid_in_string(str(ident))
+            if mbid:
+                log.info("Using Daily Jams playlist %r (mbid=%s)", pl.get("title"), mbid)
+                return mbid
+        offset += page
+        if len(playlists) < page:
+            break
+    log.info("No Daily Jams playlist matched substring %r", title_substring)
+    return ""
+
+
+def _recording_mbids_from_jspf_playlist(playlist_obj: dict) -> list[str]:
+    out: list[str] = []
+    tracks = playlist_obj.get("track") or []
+    if not isinstance(tracks, list):
+        return out
+    for tr in tracks:
+        if not isinstance(tr, dict):
+            continue
+        ident = tr.get("identifier")
+        if isinstance(ident, str):
+            mb = _first_mbid_in_string(ident)
+            if mb:
+                out.append(mb)
+                continue
+        meta = tr.get("extension") or tr.get("additional_metadata") or {}
+        if isinstance(meta, dict):
+            for k in ("recording_mbid", "recordingmbid"):
+                v = meta.get(k)
+                if isinstance(v, str) and _first_mbid_in_string(v):
+                    out.append(_first_mbid_in_string(v))
+                    break
+    return out
+
+
+def _artists_from_recording_mbids(recording_mbids: list[str], context: str) -> list[dict]:
+    """Map recording MBIDs to unique artists via metadata/recording (same pattern as loved)."""
+    if not recording_mbids:
+        return []
+    artist_by_key: dict[str, dict] = {}
+    chunk_size = 50
+    for i in range(0, len(recording_mbids), chunk_size):
+        chunk = recording_mbids[i : i + chunk_size]
+        url = f"{LISTENBRAINZ_BASE}/1/metadata/recording/"
+        headers = {"Content-Type": "application/json"}
+        if LISTENBRAINZ_TOKEN:
+            headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
+        try:
+            r = requests.post(
+                url,
+                headers=headers,
+                json={"recording_mbids": chunk, "inc": "artist"},
+                timeout=20,
+            )
+            if r.status_code in (502, 503):
+                log.warning("ListenBrainz metadata/recording returned %s; retrying chunk", r.status_code)
+                time.sleep(min(2.0, 30.0))
+                r = requests.post(
+                    url,
+                    headers=headers,
+                    json={"recording_mbids": chunk, "inc": "artist"},
+                    timeout=20,
+                )
+            r.raise_for_status()
+            _respect_listenbrainz_rate_limit_headers(r)
+            meta = r.json()
+        except Exception as e:
+            log.warning("Playlist/recording metadata chunk failed (%s): %s", context, e)
+            time.sleep(1)
+            continue
+        if not isinstance(meta, dict):
+            continue
+        for _rec_mbid, rec_data in meta.items():
+            if not isinstance(rec_data, dict):
+                continue
+            artist_info = rec_data.get("artist") or {}
+            artist_name = artist_info.get("name") or ""
+            artists_list = artist_info.get("artists") or []
+            artist_mbid = ""
+            if artists_list and isinstance(artists_list[0], dict):
+                artist_mbid = artists_list[0].get("artist_mbid") or ""
+            if not artist_name:
+                continue
+            key = artist_mbid or artist_name.lower()
+            if key in artist_by_key:
+                artist_by_key[key]["listen_count"] += 1
+            else:
+                artist_by_key[key] = {
+                    "name": artist_name,
+                    "mbid": artist_mbid,
+                    "listen_count": 1,
+                }
+        time.sleep(0.35)
+    fill_missing_artist_mbids(list(artist_by_key.values()), context)
+    return list(artist_by_key.values())
+
+
+def get_artists_from_daily_jams(username: str, title_substring: str) -> list[dict]:
+    pl_mbid = _find_daily_jams_playlist_mbid(username, title_substring)
+    if not pl_mbid:
+        return []
+    data = listenbrainz_get(f"/1/playlist/{quote(pl_mbid, safe='')}")
+    pl_wrap = data.get("playlist")
+    if not isinstance(pl_wrap, dict):
+        log.warning("Unexpected playlist payload for Daily Jams")
+        return []
+    rec_mbids = _recording_mbids_from_jspf_playlist(pl_wrap)
+    log.info("Daily Jams playlist: %d recording MBIDs", len(rec_mbids))
+    artists = _artists_from_recording_mbids(rec_mbids, "daily jams")
+    log.info("Daily Jams resolved to %d unique artists", len(artists))
+    return artists
+
+
+def get_recent_listen_seed_artists(username: str, days: int, max_listens: int = 800) -> list[dict]:
+    """Artists from listens in the last `days`, weighted by listen count."""
+    if days < 1:
+        return []
+    min_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    artist_counts: dict[str, dict] = {}
+    fetched = 0
+    max_ts: int | None = None
+
+    while fetched < max_listens:
+        params: dict = {"count": min(100, max_listens - fetched), "min_ts": min_ts}
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        data = listenbrainz_get(f"/1/user/{quote(username, safe='')}/listens", params)
+        payload = data.get("payload") or {}
+        listens = payload.get("listens") or []
+        if not listens:
+            break
+        for listen in listens:
+            if not isinstance(listen, dict):
+                continue
+            tm = listen.get("track_metadata") or {}
+            mm = tm.get("mbid_mapping") or {}
+            artist_mbids = mm.get("artist_mbids") or []
+            if not artist_mbids and mm.get("artist_mbid"):
+                artist_mbids = [mm["artist_mbid"]]
+            name = (tm.get("artist_name") or "").strip()
+            if not name and not artist_mbids:
+                continue
+            for amb in artist_mbids:
+                if not amb:
+                    continue
+                key = str(amb).lower()
+                if key in artist_counts:
+                    artist_counts[key]["listen_count"] += 1
+                else:
+                    artist_counts[key] = {
+                        "name": name or key,
+                        "mbid": str(amb),
+                        "listen_count": 1,
+                    }
+            if not artist_mbids and name:
+                key = name.lower()
+                if key not in artist_counts:
+                    artist_counts[key] = {"name": name, "mbid": "", "listen_count": 1}
+                else:
+                    artist_counts[key]["listen_count"] += 1
+        fetched += len(listens)
+        last_ts = listens[-1].get("listened_at")
+        if last_ts is None:
+            break
+        try:
+            max_ts = int(last_ts)
+        except (TypeError, ValueError):
+            break
+        if len(listens) < params["count"]:
+            break
+        time.sleep(0.15)
+
+    artists = list(artist_counts.values())
+    fill_missing_artist_mbids(artists, "recent listens")
+    log.info("Recent listens (%dd): %d unique artist keys", days, len(artists))
+    return artists
+
+
+def _merge_seed_tiers(by_mbid: dict[str, dict], artists: list[dict], tier: int) -> None:
+    for a in artists:
+        mbid = (a.get("mbid") or "").strip().lower()
+        name = (a.get("name") or "").strip()
+        if not name and not mbid:
+            continue
+        key = mbid or name.lower()
+        lc = int(a.get("listen_count") or 1)
+        if key not in by_mbid:
+            by_mbid[key] = {
+                "name": name,
+                "mbid": mbid or a.get("mbid") or "",
+                "listen_count": lc,
+                "tier": tier,
+            }
+        else:
+            cur = by_mbid[key]
+            cur["tier"] = min(int(cur["tier"]), tier)
+            cur["listen_count"] = max(int(cur["listen_count"]), lc)
+            if not cur.get("mbid") and mbid:
+                cur["mbid"] = mbid
+            if cur.get("name") == key and name:
+                cur["name"] = name
+
+
+def gather_mood_seed_artists(cfg: dict, username: str) -> list[dict]:
+    """Tier 1: Daily Jams + recent listens; tier 2: month top; tier 3: year / all_time if few MBIDs."""
+    by_key: dict[str, dict] = {}
+    t1_sub = str(cfg.get("daily_jams_title_substring") or "daily jam")
+    recent_days = int(cfg.get("recent_listens_days") or 7)
+
+    jams = get_artists_from_daily_jams(username, t1_sub)
+    for a in jams:
+        a = dict(a)
+        a["listen_count"] = a.get("listen_count") or 1
+    _merge_seed_tiers(by_key, jams, 1)
+
+    recent = get_recent_listen_seed_artists(username, recent_days)
+    _merge_seed_tiers(by_key, recent, 1)
+
+    month_top = get_top_artists(username, int(cfg["top_artists_count"]), "month")
+    _merge_seed_tiers(by_key, month_top, 2)
+
+    def _mbid_count() -> int:
+        return sum(1 for s in by_key.values() if (s.get("mbid") or "").strip())
+
+    need = int(cfg.get("mood_min_seed_mbids") or 5)
+    if _mbid_count() < need:
+        year_top = get_top_artists(username, int(cfg["top_artists_count"]), "year")
+        _merge_seed_tiers(by_key, year_top, 3)
+    if _mbid_count() < need:
+        all_top = get_top_artists(username, int(cfg["top_artists_count"]), "all_time")
+        _merge_seed_tiers(by_key, all_top, 3)
+
+    seeds = sorted(by_key.values(), key=lambda x: (x["tier"], -int(x.get("listen_count") or 0)))
+    log.info(
+        "Mood seeds: %d artists (tiers 1–3 mix; MBIDs=%d)",
+        len(seeds),
+        _mbid_count(),
+    )
+    return seeds
+
+
 def get_similar_artists(artist_mbid: str, limit: int, algorithm: str) -> list[dict]:
     """Return similar artists as [{"name": ..., "mbid": ..., "match": float}] via Labs API."""
     url = f"{LISTENBRAINZ_LABS_BASE}/similar-artists/json"
@@ -527,7 +853,7 @@ def get_similar_artists(artist_mbid: str, limit: int, algorithm: str) -> list[di
     if LISTENBRAINZ_TOKEN:
         headers["Authorization"] = f"Token {LISTENBRAINZ_TOKEN}"
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=15)
             if r.status_code == 429:
@@ -538,6 +864,15 @@ def get_similar_artists(artist_mbid: str, limit: int, algorithm: str) -> list[di
                     wait = 2 ** attempt
                 log.warning("ListenBrainz Labs rate limited, sleeping %.1fs", min(wait, 120))
                 time.sleep(min(wait, 120))
+                continue
+            if r.status_code in (502, 503):
+                wait = min(float(2**attempt), 120.0)
+                log.warning(
+                    "ListenBrainz Labs returned %s; exponential backoff %.1fs",
+                    r.status_code,
+                    wait,
+                )
+                time.sleep(wait)
                 continue
             r.raise_for_status()
             data = r.json()
@@ -587,6 +922,88 @@ def get_similar_artists(artist_mbid: str, limit: int, algorithm: str) -> list[di
     return out
 
 
+# ── MusicBrainz (metadata quality gate) ───────────────────────────────────────
+_DISALLOWED_ARTIST_TAGS = frozenset({"bootleg", "remix"})
+_DISALLOWED_RG_SECONDARY = frozenset({"remix", "dj-mix"})
+
+
+def musicbrainz_get_json(path: str, params: dict | None = None) -> dict | None:
+    """GET MusicBrainz WS JSON. Polite pacing (~1 req/s) and 502/503 backoff."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{MUSICBRAINZ_WS_BASE}{path}"
+    headers = {"User-Agent": MUSICBRAINZ_USER_AGENT, "Accept": "application/json"}
+    q = dict(params or {})
+    q.setdefault("fmt", "json")
+    time.sleep(1.05)
+    for attempt in range(5):
+        try:
+            r = requests.get(url, params=q, headers=headers, timeout=30)
+            if r.status_code in (502, 503):
+                wait = min(float(2**attempt), 90.0)
+                log.warning("MusicBrainz %s returned %s; backoff %.1fs", path, r.status_code, wait)
+                time.sleep(wait)
+                continue
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning("MusicBrainz GET %s failed (attempt %d): %s", path, attempt + 1, e)
+            time.sleep(min(float(2**attempt), 90.0))
+    return None
+
+
+def artist_passes_metadata_gate(mbid: str) -> bool:
+    """
+    Require a real artist (not Various Artists), no bootleg/remix artist tags,
+    and at least one primary-type Album release group without remix/DJ-mix secondary types.
+    """
+    mbid = (mbid or "").strip().lower()
+    if not mbid:
+        log.info("Metadata gate reject: empty MBID")
+        return False
+    if mbid == VARIOUS_ARTISTS_MBID.lower():
+        log.info("Metadata gate reject: Various Artists MBID")
+        return False
+
+    artist = musicbrainz_get_json(f"/artist/{mbid}", {"inc": "tags"})
+    if not artist:
+        log.info("Metadata gate reject: artist %s not in MusicBrainz", mbid)
+        return False
+    if (artist.get("name") or "").strip().lower() == "various artists":
+        log.info("Metadata gate reject: Various Artists by name")
+        return False
+    for t in artist.get("tags") or []:
+        if not isinstance(t, dict):
+            continue
+        tag = (t.get("name") or "").lower()
+        if tag in _DISALLOWED_ARTIST_TAGS:
+            log.info("Metadata gate reject: artist tag %r", t.get("name"))
+            return False
+
+    rg_data = musicbrainz_get_json("/release-group", {"artist": mbid, "limit": 100})
+    groups = (rg_data or {}).get("release-groups") or []
+    qualifying = 0
+    for rg in groups:
+        if not isinstance(rg, dict):
+            continue
+        if (rg.get("primary-type") or "").lower() != "album":
+            continue
+        secondaries = [str(x).lower() for x in (rg.get("secondary-types") or [])]
+        if any(s in _DISALLOWED_RG_SECONDARY for s in secondaries):
+            continue
+        qualifying += 1
+
+    if qualifying < 1:
+        log.info(
+            "Metadata gate reject: no qualifying full album (candidates in %d release groups)",
+            len(groups),
+        )
+        return False
+    return True
+
+
 # ── Lidarr helpers ────────────────────────────────────────────────────────────
 def lidarr_get(path: str, **params) -> list | dict | None:
     url = f"{LIDARR_URL}/api/v1/{path}"
@@ -612,10 +1029,27 @@ def lidarr_post(path: str, body: dict) -> dict | None:
         return None
 
 
+def get_lidarr_artists_index() -> tuple[set[str], set[str]]:
+    """Return (lowercase artist names, lowercase foreignArtistId / MBID) for Lidarr library."""
+    artists = lidarr_get("artist") or []
+    names: set[str] = set()
+    mbids: set[str] = set()
+    for a in artists:
+        if not isinstance(a, dict):
+            continue
+        an = a.get("artistName")
+        if isinstance(an, str) and an:
+            names.add(an.lower())
+        fid = a.get("foreignArtistId")
+        if fid:
+            mbids.add(str(fid).strip().lower())
+    return names, mbids
+
+
 def get_lidarr_artist_names() -> set[str]:
     """Return lowercase names of all artists currently in Lidarr."""
-    artists = lidarr_get("artist") or []
-    return {a["artistName"].lower() for a in artists}
+    n, _ = get_lidarr_artists_index()
+    return n
 
 
 def get_lidarr_profiles() -> tuple[int, int]:
@@ -627,18 +1061,24 @@ def get_lidarr_profiles() -> tuple[int, int]:
     return q_id, m_id
 
 
-def get_or_create_discovered_tag() -> int:
-    """Get the 'discovered' tag id in Lidarr, creating it if needed."""
+def get_or_create_tag(label: str) -> int | None:
+    """Get a Lidarr tag id by label (case-insensitive), creating it if needed."""
     tags = lidarr_get("tag") or []
+    want = label.lower()
     for tag in tags:
-        if tag["label"].lower() == "discovered":
-            return tag["id"]
-    # Create it
-    result = lidarr_post("tag", {"label": "discovered"})
-    if result:
-        log.info("Created 'discovered' tag in Lidarr (id=%d)", result["id"])
-        return result["id"]
+        if str(tag.get("label") or "").lower() == want:
+            tid = tag.get("id")
+            return int(tid) if tid is not None else None
+    result = lidarr_post("tag", {"label": label})
+    if result and result.get("id") is not None:
+        log.info("Created %r tag in Lidarr (id=%s)", label, result["id"])
+        return int(result["id"])
     return None
+
+
+def get_or_create_discovered_tag() -> int | None:
+    """Get the 'discovered' tag id in Lidarr, creating it if needed."""
+    return get_or_create_tag("discovered")
 
 
 def lookup_artist_in_lidarr(artist_name: str) -> dict | None:
@@ -649,10 +1089,16 @@ def lookup_artist_in_lidarr(artist_name: str) -> dict | None:
     return None
 
 
-def add_artist_to_lidarr(artist_data: dict, quality_id: int, metadata_id: int, tag_id: int) -> dict | None:
+def add_artist_to_lidarr(
+    artist_data: dict,
+    quality_id: int,
+    metadata_id: int,
+    tag_ids: list[int],
+) -> dict | None:
     """Add a looked-up artist to Lidarr, monitoring only their latest album."""
     clean = {k: v for k, v in artist_data.items()
              if k not in ("albums", "rootFolderPath", "path", "addOptions", "id")}
+    uniq_tags = sorted({int(t) for t in tag_ids if t is not None})
     body = {
         **clean,
         "qualityProfileId": quality_id,
@@ -660,7 +1106,7 @@ def add_artist_to_lidarr(artist_data: dict, quality_id: int, metadata_id: int, t
         "rootFolderPath": LIDARR_ROOT_PATH,
         "monitored": True,
         "monitorNewItems": "new",
-        "tags": [tag_id] if tag_id else [],
+        "tags": uniq_tags,
         "addOptions": {
             "monitor": "latest",               # only grab the newest album
             "searchForMissingAlbums": True,    # trigger download immediately
@@ -672,18 +1118,24 @@ def add_artist_to_lidarr(artist_data: dict, quality_id: int, metadata_id: int, t
 
 # ── Core discovery logic ──────────────────────────────────────────────────────
 def build_candidate_pool(
-    top_artists: list[dict], similar_per_artist: int, min_similarity: float, similar_algorithm: str
+    seed_artists: list[dict],
+    similar_per_artist: int,
+    min_similarity: float,
+    similar_algorithm: str,
+    tier1_multiplier: float,
 ) -> dict[str, dict]:
     """
-    For each top artist, fetch similar artists and accumulate a score.
-    Score = sum of similarity values across all seeds that recommend this artist.
-    Returns: {artist_name_lower: {"name": str, "mbid": str, "score": float}}
+    For each seed artist, fetch similar artists and accumulate a weighted score.
+    Tier-1 seeds multiply each edge's Labs match by tier1_multiplier (after MIN_SIMILARITY on raw match).
+    Returns candidate dicts with score, best_seed_name, best_raw_match, from_tier1.
     """
     candidates: dict[str, dict] = {}
+    mult1 = float(tier1_multiplier) if tier1_multiplier else 1.5
 
-    for seed in top_artists:
+    for seed in seed_artists:
         seed_name = seed.get("name", "")
         seed_mbid = (seed.get("mbid") or "").strip()
+        tier = int(seed.get("tier") or 2)
         if not seed_name:
             continue
         if not seed_mbid:
@@ -692,25 +1144,41 @@ def build_candidate_pool(
                 seed_name,
             )
             continue
-        log.info("Finding artists similar to: %s", seed_name)
+        log.info("Finding artists similar to: %s (seed tier %s)", seed_name, tier)
         similar = get_similar_artists(seed_mbid, similar_per_artist, similar_algorithm)
+        edge_mult = mult1 if tier == 1 else 1.0
 
         for artist in similar:
             name = artist.get("name", "")
             mbid = artist.get("mbid", "")
             try:
-                score = float(artist.get("match", 0))
+                raw_match = float(artist.get("match", 0))
             except (ValueError, TypeError):
-                score = 0.0
+                raw_match = 0.0
 
-            if score < min_similarity or not name:
+            if raw_match < min_similarity or not name:
                 continue
 
+            weighted = raw_match * edge_mult
             key = name.lower()
+            tier1_edge = tier == 1
             if key in candidates:
-                candidates[key]["score"] += score  # compound score
+                c = candidates[key]
+                c["score"] += weighted
+                if raw_match > float(c.get("best_raw_match") or 0.0):
+                    c["best_seed_name"] = seed_name
+                    c["best_raw_match"] = raw_match
+                if tier1_edge:
+                    c["from_tier1"] = True
             else:
-                candidates[key] = {"name": name, "mbid": mbid, "score": score}
+                candidates[key] = {
+                    "name": name,
+                    "mbid": mbid,
+                    "score": weighted,
+                    "best_seed_name": seed_name,
+                    "best_raw_match": raw_match,
+                    "from_tier1": tier1_edge,
+                }
 
     return candidates
 
@@ -765,22 +1233,29 @@ def run_discovery(config: dict | None = None) -> dict:
 
         # 1. Gather seed artists based on configured mode
         seed_artists: list[dict] = []
-        if mode in ("loved", "both"):
-            loved = get_loved_artists(LISTENBRAINZ_USERNAME, int(cfg["loved_feedback_count"]))
-            seed_artists.extend(loved)
-            log.info("Loved-artist seeds: %d", len(loved))
+        if mode == "mood":
+            seed_artists = gather_mood_seed_artists(cfg, LISTENBRAINZ_USERNAME)
+        else:
+            if mode in ("loved", "both"):
+                loved = get_loved_artists(LISTENBRAINZ_USERNAME, int(cfg["loved_feedback_count"]))
+                seed_artists.extend(loved)
+                log.info("Loved-artist seeds: %d", len(loved))
 
-        if mode in ("most_listened", "both"):
-            top = get_top_artists(
-                LISTENBRAINZ_USERNAME,
-                int(cfg["top_artists_count"]),
-                str(cfg["listenbrainz_stats_range"]),
-            )
-            seed_artists.extend(top)
-            log.info("Most-listened seeds: %d", len(top))
+            if mode in ("most_listened", "both"):
+                top = get_top_artists(
+                    LISTENBRAINZ_USERNAME,
+                    int(cfg["top_artists_count"]),
+                    str(cfg["listenbrainz_stats_range"]),
+                )
+                seed_artists.extend(top)
+                log.info("Most-listened seeds: %d", len(top))
+
+            for a in seed_artists:
+                a.setdefault("tier", 2)
 
         if not seed_artists:
             msg = {
+                "mood": "No mood seeds (Daily Jams / recent listens / monthly stats). Check ListenBrainz history and playlists.",
                 "loved": "No loved/hearted recordings found on ListenBrainz. Heart some songs in your player first.",
                 "most_listened": "No top artists returned from ListenBrainz. Is your history empty, or are statistics not computed yet?",
                 "both": "No seed artists found from loved recordings or play history.",
@@ -807,6 +1282,9 @@ def run_discovery(config: dict | None = None) -> dict:
         seed_artists = deduped
 
         seed_artist_names = {a["name"].lower() for a in seed_artists}
+        seed_artist_mbids = {
+            (a.get("mbid") or "").strip().lower() for a in seed_artists if (a.get("mbid") or "").strip()
+        }
 
         # 2. Build candidate pool from similar artists
         candidates = build_candidate_pool(
@@ -814,20 +1292,28 @@ def run_discovery(config: dict | None = None) -> dict:
             int(cfg["similar_per_artist"]),
             float(cfg["min_similarity"]),
             str(cfg["similar_algorithm"]),
+            float(cfg["tier1_similarity_multiplier"]),
         )
         log.info("Candidate pool size: %d artists", len(candidates))
 
         # 3. Remove artists already in Lidarr or already added by this service
-        lidarr_names = get_lidarr_artist_names()
-        log.info("Artists already in Lidarr: %d", len(lidarr_names))
+        lidarr_names, lidarr_mbids = get_lidarr_artists_index()
+        log.info("Artists already in Lidarr: %d (with %d MBIDs)", len(lidarr_names), len(lidarr_mbids))
 
-        filtered = {
-            k: v
-            for k, v in candidates.items()
-            if k not in lidarr_names
-            and k not in seed_artist_names
-            and not was_already_added(conn, v["name"], v["mbid"])
-        }
+        filtered: dict[str, dict] = {}
+        for k, v in candidates.items():
+            cmbid = (v.get("mbid") or "").strip().lower()
+            if k in lidarr_names:
+                continue
+            if cmbid and cmbid in lidarr_mbids:
+                continue
+            if k in seed_artist_names:
+                continue
+            if cmbid and cmbid in seed_artist_mbids:
+                continue
+            if was_already_added(conn, v["name"], v["mbid"]):
+                continue
+            filtered[k] = v
         log.info("Candidates after filtering: %d", len(filtered))
 
         # 4. Sort by score; top (N-1) by compound score plus one diversity slot from the next 10
@@ -854,7 +1340,8 @@ def run_discovery(config: dict | None = None) -> dict:
 
         # 5. Fetch Lidarr config once
         quality_id, metadata_id = get_lidarr_profiles()
-        tag_id = get_or_create_discovered_tag()
+        discovered_tag_id = get_or_create_discovered_tag()
+        mood_tag_id = get_or_create_tag("mood-discovery")
 
         # 6. Add each artist to Lidarr
         added_count = 0
@@ -866,19 +1353,51 @@ def run_discovery(config: dict | None = None) -> dict:
         for candidate in to_add:
             name = candidate["name"]
             score = candidate["score"]
-            log.info("Adding artist: %s (score=%.3f)", name, score)
+            best_seed = candidate.get("best_seed_name") or "?"
+            best_raw = float(candidate.get("best_raw_match") or 0.0)
+            log.info("Adding artist: %s (weighted score=%.3f)", name, score)
 
             artist_data = lookup_artist_in_lidarr(name)
             if not artist_data:
                 log.warning("Could not find '%s' in MusicBrainz via Lidarr, skipping.", name)
                 continue
 
-            result = add_artist_to_lidarr(artist_data, quality_id, metadata_id, tag_id)
+            gate_mbid = (candidate.get("mbid") or "").strip() or str(
+                artist_data.get("foreignArtistId") or ""
+            ).strip()
+            if not artist_passes_metadata_gate(gate_mbid):
+                log.info("Skipping '%s': metadata quality gate failed", name)
+                continue
+
+            lookup_mbid = str(artist_data.get("foreignArtistId") or "").strip().lower()
+            if lookup_mbid and lookup_mbid in lidarr_mbids:
+                log.info("Skipping '%s': already in Lidarr (MBID %s)", name, lookup_mbid)
+                continue
+            if name.lower() in lidarr_names:
+                log.info("Skipping '%s': already in Lidarr (name)", name)
+                continue
+
+            tags_to_apply: list[int] = []
+            if discovered_tag_id:
+                tags_to_apply.append(discovered_tag_id)
+            if candidate.get("from_tier1") and mood_tag_id:
+                tags_to_apply.append(mood_tag_id)
+
+            result = add_artist_to_lidarr(artist_data, quality_id, metadata_id, tags_to_apply)
             if result and result.get("id"):
                 lidarr_id = result["id"]
                 record_added(conn, name, candidate["mbid"], lidarr_id, current_run_id)
+                reason = (
+                    f'Highly similar to {best_seed} (score: {best_raw:.2f})'
+                )
+                if candidate.get("from_tier1"):
+                    reason += f"; tier-1 seed boost (×{float(cfg['tier1_similarity_multiplier']):.2f} on matching edges)"
+                log.info("Reason for selection: %s", reason)
                 log.info("Added '%s' to Lidarr (id=%d)", name, lidarr_id)
                 added_count += 1
+                if lookup_mbid:
+                    lidarr_mbids.add(lookup_mbid)
+                lidarr_names.add(name.lower())
             else:
                 log.warning("Failed to add '%s' to Lidarr.", name)
 
@@ -1275,9 +1794,13 @@ def create_app() -> Flask:
           <h3>Discovery tuning</h3>
           <div class="field">
             <label for="seeds_mode">Seed mode</label>
-            <p class="desc">Where seed artists come from: play history stats, your ListenBrainz loved tracks, or both combined.</p>
+            <p class="desc">
+              <span class="mono">mood</span>: Daily Jams / recent listens + monthly stats (tiered).
+              Other modes: play history stats, loved tracks, or both.
+            </p>
             <div class="compare">
               <div><small>Current</small><select name="seeds_mode" id="seeds_mode">
+                <option value="mood">mood</option>
                 <option value="most_listened">most_listened</option>
                 <option value="loved">loved</option>
                 <option value="both">both</option>
@@ -1303,7 +1826,7 @@ def create_app() -> Flask:
           </div>
           <div class="field">
             <label for="listenbrainz_stats_range">ListenBrainz stats range</label>
-            <p class="desc">Time window for top-artist stats (e.g. half_yearly, year, all_time).</p>
+            <p class="desc">Time window for top-artist stats when using <span class="mono">most_listened</span> (e.g. quarterly, year, all_time).</p>
             <div class="compare">
               <div><small>Current</small><input name="listenbrainz_stats_range" id="listenbrainz_stats_range" /></div>
               <div><small>Env default</small><div class="mono env-val" data-k="listenbrainz_stats_range"></div></div>
@@ -1339,6 +1862,38 @@ def create_app() -> Flask:
             <div class="compare">
               <div><small>Current</small><input name="similar_algorithm" id="similar_algorithm" /></div>
               <div><small>Env default</small><div class="mono env-val" data-k="similar_algorithm"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="mood_min_seed_mbids">Mood: minimum seed MBIDs</label>
+            <p class="desc">If tiers 1–2 yield fewer distinct artist MBIDs than this, tier 3 adds year then all_time top artists.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="mood_min_seed_mbids" id="mood_min_seed_mbids" type="number" min="1" max="100" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="mood_min_seed_mbids"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="recent_listens_days">Mood: recent listens window (days)</label>
+            <p class="desc">Tier 1 includes artists from listens in this many days.</p>
+            <div class="compare">
+              <div><small>Current</small><input name="recent_listens_days" id="recent_listens_days" type="number" min="1" max="90" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="recent_listens_days"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="daily_jams_title_substring">Mood: Daily Jams title match</label>
+            <p class="desc">Substring to find your created-for Daily Jams playlist (case-insensitive).</p>
+            <div class="compare">
+              <div><small>Current</small><input name="daily_jams_title_substring" id="daily_jams_title_substring" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="daily_jams_title_substring"></div></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="tier1_similarity_multiplier">Mood: tier 1 similarity multiplier</label>
+            <p class="desc">Applied to Labs similarity scores for edges from tier-1 seeds (Daily Jams / recent listens).</p>
+            <div class="compare">
+              <div><small>Current</small><input name="tier1_similarity_multiplier" id="tier1_similarity_multiplier" type="number" step="0.1" min="1" max="5" /></div>
+              <div><small>Env default</small><div class="mono env-val" data-k="tier1_similarity_multiplier"></div></div>
             </div>
           </div>
         </div>
@@ -1660,10 +2215,13 @@ def create_app() -> Flask:
     var fd = new FormData(ev.target);
     var payload = {};
     fd.forEach(function (v, k) { payload[k] = v; });
-    ['top_artists_count','loved_feedback_count','similar_per_artist','max_new_artists','run_interval_seconds'].forEach(function (k) {
+    ['top_artists_count','loved_feedback_count','similar_per_artist','max_new_artists','run_interval_seconds','mood_min_seed_mbids','recent_listens_days'].forEach(function (k) {
       payload[k] = parseInt(payload[k], 10);
     });
     payload.min_similarity = parseFloat(payload.min_similarity);
+    var t1m = parseFloat(payload.tier1_similarity_multiplier);
+    if (Number.isFinite(t1m)) payload.tier1_similarity_multiplier = t1m;
+    else delete payload.tier1_similarity_multiplier;
     var r = await api('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1744,7 +2302,8 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             return jsonify({"error": "invalid_json"}), 400
-        save_settings_file(_coerce_settings(body))
+        merged_input = {**effective_settings(), **body}
+        save_settings_file(_coerce_settings(merged_input))
         return jsonify({"ok": True, "config": _coerce_settings(effective_settings())})
 
     @app.post("/api/run")
